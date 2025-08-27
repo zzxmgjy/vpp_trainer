@@ -8,6 +8,7 @@ import os
 import json
 import torch
 import numpy as np
+from util.logger import logger
 
 try:
     import optuna
@@ -31,7 +32,7 @@ class IncrementalTrainer:
         if n_layers <= 0:
             return
 
-        print(f" 冻结前 {n_layers} 层 backbone 参数")
+        logger.info(f" 冻结前 {n_layers} 层 backbone 参数")
         frozen_params = 0
         total_params = 0
 
@@ -43,29 +44,29 @@ class IncrementalTrainer:
                     param.requires_grad = False
                     frozen_params += param.numel()
 
-        print(f"已冻结 {frozen_params:,} / {total_params:,} 个backbone参数")
+        logger.info(f"已冻结 {frozen_params:,} / {total_params:,} 个backbone参数")
 
     def unfreeze_all_layers(self):
         """解冻所有层"""
-        print(" 解冻所有模型参数")
+        logger.info(" 解冻所有模型参数")
         for param in self.model.parameters():
             param.requires_grad = True
 
     def load_pretrained_weights(self, model_path: str):
         """加载预训练权重"""
         if os.path.exists(model_path):
-            print(f" 加载预训练模型: {model_path}")
+            logger.info(f" 加载预训练模型: {model_path}")
             self.model.load_state_dict(torch.load(model_path, map_location=self.device))
             return True
         else:
-            print(f"  预训练模型不存在: {model_path}")
+            logger.info(f"  预训练模型不存在: {model_path}")
             return False
 
     def incremental_train(self, train_loader, val_loader, criterion,
                           finetune_lr: float, finetune_epochs: int,
                           finetune_patience: int, freeze_layers: int = 0):
         """执行增量训练"""
-        print("\n 开始增量微调...")
+        logger.info("\n 开始增量微调...")
 
         # 冻结指定层数
         if freeze_layers > 0:
@@ -148,7 +149,7 @@ class IncrementalTrainer:
             })
 
             if epoch % 10 == 0:
-                print(f"微调 Epoch {epoch:03d} | train {train_loss:.5f} | valid {val_loss:.5f}")
+                logger.info(f"微调 Epoch {epoch:03d} | train {train_loss:.5f} | valid {val_loss:.5f}")
 
             # 早停检查
             if val_loss < best_val_loss:
@@ -159,7 +160,7 @@ class IncrementalTrainer:
             else:
                 patience_counter += 1
                 if patience_counter >= finetune_patience:
-                    print(f" 微调早停! (epoch {epoch})")
+                    logger.info(f" 微调早停! (epoch {epoch})")
                     break
 
         # 解冻所有层
@@ -169,7 +170,7 @@ class IncrementalTrainer:
         with open(f"{self.out_dir}/finetune_history.json", 'w') as f:
             json.dump(self.training_history, f, indent=2)
 
-        print(f" 增量微调完成! 最佳验证损失: {best_val_loss:.5f}")
+        logger.info(f" 增量微调完成! 最佳验证损失: {best_val_loss:.5f}")
         return best_val_loss
 
 
@@ -231,7 +232,7 @@ class HyperparameterOptimizer:
             return val_loss
 
         except Exception as e:
-            print(f" Trial {trial.number} 失败: {e}")
+            logger.info(f" Trial {trial.number} 失败: {e}")
             return float('inf')
 
     def _train_with_config(self, config, trial):
@@ -335,7 +336,7 @@ class HyperparameterOptimizer:
 
             val_loss /= len(va_loader)
             scheduler.step(val_loss)
-            print(f"[Trial {trial.number}] Epoch {epoch:02d} | train {train_loss:.5f} | valid {val_loss:.5f}")
+            logger.info(f"[Trial {trial.number}] Epoch {epoch:02d} | train {train_loss:.5f} | valid {val_loss:.5f}")
             # 早停检查
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -355,10 +356,10 @@ class HyperparameterOptimizer:
     def optimize(self, n_trials: int = 100, timeout: int = 3600, enable_pruning: bool = True):
         """执行超参数优化"""
         if not OPTUNA_AVAILABLE:
-            print(" Optuna未安装，无法进行超参数优化")
+            logger.info(" Optuna未安装，无法进行超参数优化")
             return None
 
-        print(f" 开始超参数搜索 (试验次数: {n_trials}, 超时: {timeout}s)")
+        logger.info(f" 开始超参数搜索 (试验次数: {n_trials}, 超时: {timeout}s)")
 
         # 创建study
         pruner = MedianPruner() if enable_pruning else None
@@ -397,9 +398,9 @@ class HyperparameterOptimizer:
         with open(f"{self.out_dir}/hyperopt_results.json", 'w') as f:
             json.dump(results, f, indent=2)
 
-        print(f" 超参数优化完成!")
-        print(f"最佳验证损失: {self.best_score:.5f}")
-        print(f"最佳参数: {self.best_params}")
+        logger.info(f" 超参数优化完成!")
+        logger.info(f"最佳验证损失: {self.best_score:.5f}")
+        logger.info(f"最佳参数: {self.best_params}")
 
         return self.best_params, self.best_score
 
@@ -409,9 +410,9 @@ def apply_incremental_training(model, train_loader, val_loader, criterion, devic
     if not cfg.get('incremental_training', False):
         return model
 
-    print("\n" + "="*50)
-    print(" 启动增量微调模式")
-    print("="*50)
+    logger.info("\n" + "="*50)
+    logger.info(" 启动增量微调模式")
+    logger.info("="*50)
 
     trainer = IncrementalTrainer(model, device, out_dir)
 
@@ -435,9 +436,9 @@ def apply_incremental_training(model, train_loader, val_loader, criterion, devic
         finetuned_path = f"{out_dir}/bi_mamba.pth"
         if os.path.exists(finetuned_path):
             model.load_state_dict(torch.load(finetuned_path, map_location=device))
-            print(" 已加载微调后的最佳模型")
+            logger.info(" 已加载微调后的最佳模型")
     else:
-        print("  未找到预训练模型，跳过增量微调")
+        logger.info("  未找到预训练模型，跳过增量微调")
 
     return model
 
@@ -447,9 +448,9 @@ def apply_hyperparameter_optimization(train_data, val_data, feature_cols, scaler
     if not cfg.get('enable_hyperopt', False):
         return None
 
-    print("\n" + "="*50)
-    print(" 启动自动超参数调优")
-    print("="*50)
+    logger.info("\n" + "="*50)
+    logger.info(" 启动自动超参数调优")
+    logger.info("="*50)
 
     optimizer = HyperparameterOptimizer(
         train_data=train_data,
