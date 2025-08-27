@@ -131,7 +131,11 @@ class LstmService:
                         df.to_csv(csv_path, index=False)
                         logger.info(f"场站 {station_id} 的预测结果已保存到: {csv_path}")
                         #上传到ftp
-                        uploadToFtp(csv_path)
+                        files_to_upload = {
+                            csv_path: csv_path
+                        }
+                        # 3. 传递字典给 uploadToFtp 函数
+                        uploadToFtp(files_to_upload)
                         logger.info(f"场站 {station_id} 的预测结果已上传到ftp")
                     else:
                         logger.warning(f"场站 {station_id} 没有预测结果，跳过保存")
