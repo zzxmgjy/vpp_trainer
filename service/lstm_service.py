@@ -141,8 +141,9 @@ class LstmService:
                             logger.error(f"[调试] 致命错误：文件 {csv_path} 在调用uploadToFtp之前不存在！")
                             continue # 如果文件不存在，跳过上传
                         #上传到ftp
+                        upload_dir = config.getFtpUploadModelDir()
                         files_to_upload = {
-                            csv_path: csv_path
+                            csv_path: f"{upload_dir}/{station_id}/lstm/forcast/{date}.csv"
                         }
                         # 3. 传递字典给 uploadToFtp 函数
                         uploadToFtp(files_to_upload)
