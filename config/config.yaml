@@ -1,0 +1,44 @@
+server:
+  host: "127.0.0.1"
+  port: 8001
+
+
+cron:
+  # download data from SFTP server
+  data:
+    hour: 1
+    minute: 1
+  # train model
+  train:
+    hour: 1
+    minute: 30
+  # train lstm model
+  trainLstm:
+    day: 1
+    hour: 1
+    minute: 30
+  # forecast model
+  forecast:
+    hour: 0
+    minute: 15
+logging:
+  dir: "logs"
+  file: "training.log"
+  max_size: 10485760  # 10MB
+  backup_count: 5
+  level: "INFO"
+
+dir:
+  # dir: "/Users/yang/git/vpp_cloud_forcast/data" # Configurable absolute path
+  data: "data" # Configurable relative path, the data directory is the current directory where the Python code is executed
+
+  # dir: "/Users/yang/git/vpp_cloud_forcast/model" # Configurable absolute path
+  model: "model" # Configurable relative path, the model directory is the current directory where the Python code is executed
+
+sftp:
+  host: "192.168.0.222" # empty if no need to upload/download
+  port: 22345
+  username: "root"
+  password: "root"
+  upload_model_dir: "./training/model" # empty if no need to upload，otherwise generated source file will be uploaded to this directory
+  download_data_dir: "./training/data" # empty if no need to download, otherwise files will be downloaded from this directory

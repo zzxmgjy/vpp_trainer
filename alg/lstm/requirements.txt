@@ -1,0 +1,20 @@
+# 基础依赖
+numpy
+pandas
+matplotlib
+scikit-learn
+
+# 模型持久化
+joblib
+
+# 可选依赖（如启用）
+# 超参数优化
+optuna
+
+# 其他工具
+argparse
+warnings
+time
+os
+json
+typing

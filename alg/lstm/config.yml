@@ -1,0 +1,8 @@
+# 定时器的运行时间cron表达式
+task:
+  cron: "0 0 1 * *"  # 默认每月1日0点0分执行
+
+# 目录配置
+output:
+  path: "output"  # 默认训练文件夹目录
+  model_path: "model"  # 默认模型结果输出目录
