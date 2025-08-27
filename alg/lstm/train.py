@@ -16,6 +16,7 @@ import torch, torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data      import DataLoader, TensorDataset
 from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
+from util.logger import logger
 import joblib
 import yaml
 import logging
@@ -69,7 +70,7 @@ try:
     MAMBA_AVAILABLE = True
 except Exception:
     MAMBA_AVAILABLE = False
-    print("mamba_ssm 未找到，使用脚本内 fallback Mamba（仅用于快速测试，建议在生产安装官方包）。")
+    logger.info("mamba_ssm 未找到，使用脚本内 fallback Mamba（仅用于快速测试，建议在生产安装官方包）。")
     class Mamba(nn.Module):
         def __init__(self, d_model, d_state=16, d_conv=4, expand=2, use_fast_path=True):
             super().__init__()
@@ -287,11 +288,11 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
                 src_file = os.path.join(model_save_dir, file_name)
                 if os.path.isfile(src_file):
                     shutil.copy2(src_file, os.path.join(history_dir_with_timestamp, file_name))
-                    print(f"已将文件 {file_name} 备份到历史目录 {history_dir_with_timestamp}")
+                    logger.info(f"已将文件 {file_name} 备份到历史目录 {history_dir_with_timestamp}")
 
         data_file = f"{output_path}/{station_id}/data/data-{station_id}-all.csv"
 
-    print(f"加载 {data_file} ...")
+    logger.info(f"加载 {data_file} ...")
     df = pd.read_csv(data_file, low_memory=False)
 
     # 统一时间列名
@@ -375,14 +376,14 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
     knowable_future_features = feature_cols.copy()
     unknowable_future_features = []
 
-    print(f"使用原始特征: {feature_cols}")
-    print(f"特征总数: {len(feature_cols)}")
+    logger.info(f"使用原始特征: {feature_cols}")
+    logger.info(f"特征总数: {len(feature_cols)}")
 
     # 划分窗口与 scaler（fit 只在 train_df 上）
     hold_out=df.iloc[-CFG['future_steps']:]
     train_df=df.iloc[:-CFG['future_steps']]
     if len(train_df) < CFG['past_steps'] + CFG['future_steps']:
-        print(f" 错误: 训练数据太少，无法创建至少一个完整的输入窗口。")
+        logger.info(f" 错误: 训练数据太少，无法创建至少一个完整的输入窗口。")
         return
 
     # Scaler 拟合时会忽略NaN，这是正确的行为
@@ -450,7 +451,7 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
     assert X_va.shape[1] == CFG['past_steps'] + CFG['future_steps'], "验证窗口长度不匹配！"
 
     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print("Device:", device)
+    logger.info("Device:", device)
 
     # =========================================================
     # 6) 超参数优化 (可选)
@@ -469,7 +470,7 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
         )
 
         if best_params:
-            print(f"\n 使用优化后的超参数进行训练")
+            logger.info(f"\n 使用优化后的超参数进行训练")
             # 更新配置
             for key, value in best_params.items():
                 if key in ['d_model', 'n_layers', 'drop_rate', 'd_state', 'd_conv', 'expand', 'patch_len', 'stride', 'batch_size', 'lr', 'power_weight', 'not_use_power_weight']:
@@ -522,7 +523,7 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
     patience = CFG['patience']
     wait = 0
     best_val = float('inf')
-    print("开始训练 ...")
+    logger.info("开始训练 ...")
     epsilon = 1e-9 # 防止除以零
     for ep in range(1, CFG['epochs']+1):
         model.train()
@@ -577,7 +578,7 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
             scheduler.step(ep)
 
         if ep % 5 == 0 or ep == 1:
-            print(f"Epoch {ep:03d}/{CFG['epochs']} | train_loss={tl:.6f} | val_loss={vl:.6f} | lr={opt.param_groups[0]['lr']:.2e}")
+            logger.info(f"Epoch {ep:03d}/{CFG['epochs']} | train_loss={tl:.6f} | val_loss={vl:.6f} | lr={opt.param_groups[0]['lr']:.2e}")
 
         if vl < best_val:
             best_val = vl; wait = 0
@@ -585,10 +586,10 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
         else:
             wait += 1
             if wait >= patience:
-                print("触发早停 (patience reached).")
+                logger.info("触发早停 (patience reached).")
                 break
 
-    print("\n--- 保留集评估 ---")
+    logger.info("\n--- 保留集评估 ---")
     if os.path.exists(os.path.join(out_dir, 'bi_mamba.pth')):
         model.load_state_dict(torch.load(os.path.join(out_dir, 'bi_mamba.pth'), map_location=device))
     model.eval()
@@ -620,11 +621,11 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
     n_mape = mape(tgt_n, pred_n)
     n_rmse = np.sqrt(mean_squared_error(tgt_n[~np.isnan(tgt_n)], pred_n[~np.isnan(tgt_n)]))
 
-    print("\n--- 评估结果 ---")
-    print(f"{station_id} 总功率 MAPE={p_mape:.2f}% RMSE={p_rmse:.2f}")
-    print(f"{station_id} 负荷 MAPE={n_mape:.2f}% RMSE={n_rmse:.2f}")
+    logger.info("\n--- 评估结果 ---")
+    logger.info(f"{station_id} 总功率 MAPE={p_mape:.2f}% RMSE={p_rmse:.2f}")
+    logger.info(f"{station_id} 负荷 MAPE={n_mape:.2f}% RMSE={n_rmse:.2f}")
 
-    print("\n--- 每日 MAPE ---")
+    logger.info("\n--- 每日 MAPE ---")
     daily = {}
     for d in range(7):
         s, e = d*96, (d+1)*96
@@ -633,7 +634,7 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
         date = hold_out.iloc[s].energy_date.strftime('%Y-%m-%d')
         m1, m2 = mape(dp, pp), mape(dn, pn)
         daily[f"day_{d+1}"] = {'date': date, 'power_mape': m1, 'load_mape': m2}
-        print(f"{date}: meter {m1:.2f}%  load {m2:.2f}%")
+        logger.info(f"{date}: meter {m1:.2f}%  load {m2:.2f}%")
 
     joblib.dump({'overall': {'power_mape': p_mape, 'load_mape': n_mape}, 'daily': daily}, os.path.join(out_dir, 'mape.pkl'))
 
@@ -650,10 +651,10 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
         joblib.dump(CFG, os.path.join(model_save_dir, 'config.pkl'))
         joblib.dump({'overall': {'power_mape': p_mape, 'load_mape': n_mape}, 'daily': daily}, os.path.join(model_save_dir, 'mape.pkl'))
 
-        print(f"\n 模型已保存至: {model_save_dir}")
-        print(f" 历史模型目录: {model_base_path}/{station_id}/history/lstm")
+        logger.info(f"\n 模型已保存至: {model_save_dir}")
+        logger.info(f" 历史模型目录: {model_base_path}/{station_id}/history/lstm")
 
-    print(f"\n 完成！总耗时 {time.time()-tic:.1f}s ; 结果已保存至 {out_dir}")
+    logger.info(f"\n 完成！总耗时 {time.time()-tic:.1f}s ; 结果已保存至 {out_dir}")
 
 # =========================================================
 # CLI
@@ -679,5 +680,5 @@ if __name__=="__main__":
         main(args.station_id, args.data_file, args.enable_hyperopt, args.enable_incremental, args_cli=args)
     except Exception as e:
         import traceback, sys
-        print(f"\n 运行错误: {e}")
+        logger.info(f"\n 运行错误: {e}")
         traceback.print_exc(file=sys.stdout)
