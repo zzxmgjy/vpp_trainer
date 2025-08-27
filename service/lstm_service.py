@@ -81,8 +81,13 @@ class LstmService:
                 df.to_csv(csv_path, index=False)
                 
                 logger.info(f" {customer_number}预测结果已保存到: {csv_path}")
+
                 #上传到ftp
-                uploadToFtp(csv_path)
+                files_to_upload = {
+                    csv_path: csv_path
+                }
+                # 3. 传递字典给 uploadToFtp 函数
+                uploadToFtp(files_to_upload)
                 logger.info(f" {customer_number}预测结果已上传到ftp")
                 return csv_path
                 
@@ -130,6 +135,11 @@ class LstmService:
                         df = pd.DataFrame(station_result)
                         df.to_csv(csv_path, index=False)
                         logger.info(f"场站 {station_id} 的预测结果已保存到: {csv_path}")
+                        if os.path.exists(csv_path):
+                            logger.info(f"[调试] 文件 {csv_path} 在调用uploadToFtp之前存在。")
+                        else:
+                            logger.error(f"[调试] 致命错误：文件 {csv_path} 在调用uploadToFtp之前不存在！")
+                            continue # 如果文件不存在，跳过上传
                         #上传到ftp
                         files_to_upload = {
                             csv_path: csv_path

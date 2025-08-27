@@ -82,6 +82,9 @@ def uploadToFtp(files : dict):
         transport.connect(username=sftp_config.username, password=sftp_config.password)
         sftp = paramiko.SFTPClient.from_transport(transport)
         for local_path, remote_path in files.items():
+            if not os.path.exists(local_path):
+                logger.error(f"[调试] 在uploadToFtp函数内部，文件 {local_path} 不存在！")
+                continue # 跳过这个不存在的文件
             # Check if remote directory exists, create if not
             remote_dir = os.path.dirname(remote_path)
             try:
