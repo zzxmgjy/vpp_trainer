@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from router.router import router
 from router.lightgbm_router import lightgbm_router
+from router.lstm_router import lstm_router
 from util.logger import logger
 import uvicorn
 from util.ftp import downloadFromFtp
@@ -17,6 +18,7 @@ from config.app_config import config
 app = FastAPI()
 app.include_router(router, prefix="/api/v1")
 app.include_router(lightgbm_router, prefix="/api/v1")
+app.include_router(lstm_router, prefix="/api/v1/lstm")
 
 def dowload_data():
     downloadFromFtp(config.getFtpDownloadDataDir(), config.get_data_dir())

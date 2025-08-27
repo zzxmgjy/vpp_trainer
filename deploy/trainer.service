@@ -1,0 +1,18 @@
+[Unit]
+Description=FastAPI Application with Gunicorn
+After=network.target
+
+[Service]
+Type=simple
+User=ems
+Group=ems
+WorkingDirectory=/opt/deploy/vpp-trainer
+Environment="PATH=/opt/deploy/myenv/bin"
+Environment="PYTHONPATH=/opt/deploy/vpp-trainer"
+
+ExecStart=/opt/deploy/myenv/bin/gunicorn --config /opt/deploy/vpp-trainer/gunicorn_conf.py main:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

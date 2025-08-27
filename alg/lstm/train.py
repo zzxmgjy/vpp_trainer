@@ -458,7 +458,7 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
 
     # 如果启用超参数优化，先进行搜索
     if CFG.get('enable_hyperopt', False):
-        from incremental_training_new import apply_hyperparameter_optimization
+        from alg.lstm.incremental_training_new import apply_hyperparameter_optimization
 
         train_data = (X_tr, Yp_tr, Yn_tr, Mask_p_tr, Mask_n_tr)
         val_data = (X_va, Yp_va, Yn_va, Mask_p_va, Mask_n_va)

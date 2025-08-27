@@ -39,6 +39,7 @@ class LightgbmService:
         train_data = train_data[(train_data['time'] <= end_date) & (train_data['time'] >= start_date)]
         meter_model = train_meter(train_data)
         load_model = train_load(train_data)
+        logger.info(f"[train_by_lightgbm][{customer_number}] train success")
         if update_model:
             save_model(meter_model_path, meter_model)
             save_model(meter_model_his_path, meter_model)
@@ -49,41 +50,48 @@ class LightgbmService:
             files[f"{meter_model_path}"] = f"{upload_dir}/{customer_number}/lightgbm/meter.pkl"
             files[f"{load_model_path}"] = f"{upload_dir}/{customer_number}/lightgbm/load.pkl"
             uploadToFtp(files)
+            logger.info(f"[train_by_lightgbm][{customer_number}] uploadToFtp success")
         return {"status": "completed"}
 
     @staticmethod
     def train_all_lightgbm():
-        model_dir = LightgbmService.get_model_dir()
-        data_dir = LightgbmService.get_data_dir()
-        upload_dir = config.getFtpUploadModelDir()
-        logger.info(f"data_dir dir is {data_dir}")
-        path = Path(data_dir)
-        files = {}
-        for item in path.iterdir():
-            customer_number = item.name
-            if not item.is_dir():
-                continue
-            csv_dir = Path(f"{data_dir}/{customer_number}/data")
-            meter_model_path = Path(f"{model_dir}/{customer_number}/lightgbm/meter.pkl")
-            load_model_path = Path(f"{model_dir}/{customer_number}/lightgbm/load.pkl")
-            time_str = datetime.now().strftime("%Y-%m-%d-%H%M")
-            meter_model_his_path = Path(f"{model_dir}/{customer_number}/lightgbm/his/meter-{time_str}.pkl")
-            load_model_his_path = Path(f"{model_dir}/{customer_number}/lightgbm/his/load-{time_str}.pkl")
-            train_data = pd.DataFrame()
-            path = Path(csv_dir)
-            for month_data_path in path.glob("*.csv"):
-                month_data = pd.read_csv(month_data_path)
-                train_data = pd.concat([
-                    train_data,
-                    month_data
-                ])
-            meter_model = train_meter(train_data)
-            save_model(meter_model_path, meter_model)
-            save_model(meter_model_his_path, meter_model)
-            load_model = train_load(train_data)
-            save_model(load_model_path, load_model)
-            save_model(load_model_his_path, meter_model)
-            files[f"{meter_model_path}"] = f"{upload_dir}/{customer_number}/lightgbm/meter.pkl"
-            files[f"{load_model_path}"] = f"{upload_dir}/{customer_number}/lightgbm/load.pkl"
-        uploadToFtp(files)
-        return {"status": "completed"}
+        try:
+            model_dir = config.get_model_dir()
+            data_dir = config.get_data_dir()
+            upload_dir = config.getFtpUploadModelDir()
+            logger.info(f"data_dir dir is {data_dir}")
+            path = Path(data_dir)
+            files = {}
+            for item in path.iterdir():
+                customer_number = item.name
+                if not item.is_dir():
+                    continue
+                csv_dir = Path(f"{data_dir}/{customer_number}/data")
+                meter_model_path = Path(f"{model_dir}/{customer_number}/lightgbm/meter.pkl")
+                load_model_path = Path(f"{model_dir}/{customer_number}/lightgbm/load.pkl")
+                time_str = datetime.now().strftime("%Y-%m-%d-%H%M")
+                meter_model_his_path = Path(f"{model_dir}/{customer_number}/lightgbm/his/meter-{time_str}.pkl")
+                load_model_his_path = Path(f"{model_dir}/{customer_number}/lightgbm/his/load-{time_str}.pkl")
+                train_data = pd.DataFrame()
+                path = Path(csv_dir)
+                for month_data_path in path.glob("*.csv"):
+                    month_data = pd.read_csv(month_data_path)
+                    train_data = pd.concat([
+                        train_data,
+                        month_data
+                    ])
+                meter_model = train_meter(train_data)
+                save_model(meter_model_path, meter_model)
+                save_model(meter_model_his_path, meter_model)
+                load_model = train_load(train_data)
+                save_model(load_model_path, load_model)
+                save_model(load_model_his_path, meter_model)
+                files[f"{meter_model_path}"] = f"{upload_dir}/{customer_number}/lightgbm/meter.pkl"
+                files[f"{load_model_path}"] = f"{upload_dir}/{customer_number}/lightgbm/load.pkl"
+                logger.info(f"[train_all_lightgbm][{customer_number}] train success")
+            uploadToFtp(files)
+            logger.info(f"[train_all_lightgbm] uploadToFtp success")
+            return {"status": "completed"}
+        except Exception as e:
+            logger.error(f"[train_all_lightgbm] {e}")
+            return
