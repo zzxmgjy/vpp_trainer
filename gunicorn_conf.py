@@ -17,7 +17,7 @@ except Exception as e:
     log_dir = "/tmp"
 
 # 绑定地址和端口
-bind = "127.0.0.1:8000"
+bind = "127.0.0.1:8001"
 
 # Worker 数量 (CPU核心数 * 2 + 1)
 #workers = multiprocessing.cpu_count() * 2 + 1
