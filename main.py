@@ -46,7 +46,7 @@ def forecast_model():
     today = datetime.now().strftime("%Y-%m-%d")
     """lstm"""
     logger.info(f"forecast_model by lstm for {today}")
-    LstmService.predict_all_lstm()
+    LstmService.predict_all_lstm(today)
     logger.info(f"forecast_model by lstm for {today} complete")
 
 # 配置调度任务
