@@ -19,8 +19,12 @@ def merge_station_data(station_id, output_path):
         logger.warning(f"场站 {station_id} 的数据目录不存在: {data_dir}")
         return False
 
+    # 确保all目录存在
+    all_dir = data_dir / "all"
+    all_dir.mkdir(exist_ok=True)
+    
     # 合并后的文件路径
-    all_data_file = data_dir / f"data-{station_id}-all.csv"
+    all_data_file = all_dir / f"data-{station_id}-all.csv"
 
     # 查找所有月度数据文件
     pattern = f"data-{station_id}-????-??.csv"
