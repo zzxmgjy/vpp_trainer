@@ -4,13 +4,17 @@ After=network.target
 
 [Service]
 Type=simple
-User=ems
-Group=ems
+User=root
+Group=root
 WorkingDirectory=/opt/deploy/vpp-trainer
-Environment="PATH=/opt/deploy/myenv/bin"
-Environment="PYTHONPATH=/opt/deploy/vpp-trainer"
+# 保留基础环境变量，确保系统工具可用
+Environment="PATH=/opt/deploy/myenv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="CUDA_HOME=/usr/local/cuda-12.6"
+Environment="LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64"
 
-ExecStart=/opt/deploy/myenv/bin/gunicorn --config /opt/deploy/vpp-trainer/gunicorn_conf.py main:app
+# 关键：通过bash激活虚拟环境后启动
+ExecStart=/bin/bash -l -c 'source /opt/deploy/myenv/bin/activate && gunicorn --config /opt/deploy/vpp-trainer/gunicorn_conf.py main:app'
+
 Restart=always
 RestartSec=5
 
