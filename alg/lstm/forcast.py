@@ -11,19 +11,11 @@ import torch
 import joblib
 import yaml
 import datetime
-from typing import List, Dict, Any, Tuple
-import logging
-from pathlib import Path
+from util.logger import logger
 import warnings
 
 warnings.filterwarnings("ignore")
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 # 加载配置文件
 def load_config(config_path="config.yml"):
