@@ -98,7 +98,13 @@ def merge_station_data(station_id, output_path):
 
         # 使用追加模式(mode='a')写入文件，如果文件不存在则会创建
         # header=not all_data_file.exists() 确保只有在文件首次创建时才写入表头
-        all_new_df.to_csv(all_data_file, mode='a', header=not all_data_file.exists() or all_data_file.stat().st_size == 0, index=False)
+        all_new_df.to_csv(
+            all_data_file,
+            mode='a',
+            header=not all_data_file.exists() or all_data_file.stat().st_size == 0,
+            index=False,
+            lineterminator='\n'
+        )
 
         logger.info(f"成功向 {all_data_file.name} 追加 {len(all_new_df)} 条新记录。")
         return True
