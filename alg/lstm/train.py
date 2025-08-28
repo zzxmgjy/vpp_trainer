@@ -290,7 +290,7 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
                     shutil.copy2(src_file, os.path.join(history_dir_with_timestamp, file_name))
                     logger.info(f"已将文件 {file_name} 备份到历史目录 {history_dir_with_timestamp}")
 
-        data_file = f"{output_path}/{station_id}/data/data-{station_id}-all.csv"
+        data_file = f"{output_path}/{station_id}/data/all/data-{station_id}-all.csv"
 
     logger.info(f"加载 {data_file} ...")
     df = pd.read_csv(data_file, low_memory=False)
