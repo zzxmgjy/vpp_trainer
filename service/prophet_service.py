@@ -11,10 +11,11 @@ import argparse
 import sys
 import time
 import string
-
+from util.ftp import uploadToFtp
 
 PROPHET_MODEL = 'prophet'
 feature_cols = ['ds','holiday','is_peak','code','temperature']
+modle_types = {"load","meter"}
 MONTH_NUMBER = 6
 
 
@@ -22,15 +23,48 @@ class ProphetService:
 
     @staticmethod
     def train_all_prophet():
-        modle_type = {"load","meter"}
+       
         model_dir = config.get_model_dir()
         data_dir = config.get_data_dir()
         logger.info(f"data_dir dir is {data_dir}")
         
-        for mode_type in modle_type:
-            ProphetService.train_prophet(data_dir,model_dir,mode_type,MONTH_NUMBER)
+        customer_numbers =    ProphetService.list_company(data_dir)
+        for customer_number in customer_numbers:
+            ProphetService.train_by_prophet(customer_number,True)
 
 
+
+    @staticmethod
+    def train_by_prophet(customer_number: str = None,update_model: bool = False):             
+        model_dir = config.get_model_dir()
+        data_dir = config.get_data_dir()
+        logger.info(f"[train_customer_prophet][{customer_number}] start  {update_model}")
+
+        for model_type in modle_types:
+            loadpf = ProphetService.load_train_data(data_dir,customer_number,MONTH_NUMBER)    
+            loadpf = loadpf.rename(columns={'time': 'ds', model_type: 'y'})            
+            model = Prophet(changepoint_prior_scale=0.5,growth='flat', weekly_seasonality=True, daily_seasonality=True )
+            
+            model.add_regressor(feature_cols[1])
+            model.add_regressor(feature_cols[2])
+            model.add_regressor(feature_cols[3])
+            model.add_regressor(feature_cols[4])
+         
+            model.fit(loadpf)           
+            model_filename = ProphetService.get_model_fullpath(model_dir,customer_number,model_type)
+            
+            with open(model_filename, 'wb') as f:
+                pickle.dump(model, f, pickle.HIGHEST_PROTOCOL)
+            
+            logger.info(f"[train_customer_prophet][{customer_number}] End ")
+            
+            if update_model == True: 
+                files = {}
+                upload_dir = config.getFtpUploadModelDir()
+                remote_filename =  ProphetService.get_model_fullpath(upload_dir,customer_number,model_type)
+                files[f"{model_filename}"] = f"{remote_filename}"
+                uploadToFtp(files)
+                logger.info(f"[train_customer_prophet][{customer_number}] uploadToFtp success")
 
 
     @staticmethod
