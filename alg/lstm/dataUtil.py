@@ -39,7 +39,7 @@ def merge_station_data(station_id, output_path):
             # 对于中小型CSV，直接读取最后一列也可以
             df_tail = pd.read_csv(all_data_file, usecols=['time']).tail(1)
             if not df_tail.empty:
-                last_time = pd.to_datetime(df_tail['time'].iloc[0])
+                last_time = pd.to_datetime(df_tail['time'].iloc[0], format='%Y-%m-%d %H:%M:%S')
                 logger.info(f"合并文件 {all_data_file.name} 最后记录时间: {last_time}")
         except Exception as e:
             logger.error(f"读取 {all_data_file.name} 的最后时间失败: {e}。将进行全量合并。")
@@ -68,7 +68,7 @@ def merge_station_data(station_id, output_path):
                     continue
 
                 # 确保 time 列是 datetime 类型
-                df['time'] = pd.to_datetime(df['time'])
+                df['time'] = pd.to_datetime(df['time'], format='%Y-%m-%d %H:%M:%S')
 
                 if last_time:
                     # 核心逻辑：只筛选出时间戳严格大于 last_time 的数据
@@ -98,7 +98,14 @@ def merge_station_data(station_id, output_path):
 
         # 使用追加模式(mode='a')写入文件，如果文件不存在则会创建
         # header=not all_data_file.exists() 确保只有在文件首次创建时才写入表头
-        all_new_df.to_csv(all_data_file, mode='a', header=not all_data_file.exists() or all_data_file.stat().st_size == 0, index=False)
+        all_new_df.to_csv(
+            all_data_file,
+            mode='a',
+            header=not all_data_file.exists() or all_data_file.stat().st_size == 0,
+            index=False,
+            lineterminator='\n',
+            date_format='%Y-%m-%d %H:%M:%S'
+        )
 
         logger.info(f"成功向 {all_data_file.name} 追加 {len(all_new_df)} 条新记录。")
         return True
