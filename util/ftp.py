@@ -75,36 +75,46 @@ def uploadToFtp(files : dict):
         logger.info("No files to upload")
         return
     
-    # Upload to SFTP server
     sftp_config = config.sftp
+    
+    if sftp_config.host is None or sftp_config.port is None:
+        logger.error("SFTP host or port is not configured")
+        return
+    
+    sftp_config = config.sftp
+    logger.info(f"Starting upload to {sftp_config.host}:{sftp_config.port}")
+    
     try:
-        transport = paramiko.Transport(sftp_config.host, sftp_config.port)
-        transport.connect(username=sftp_config.username, password=sftp_config.password)
-        sftp = paramiko.SFTPClient.from_transport(transport)
-        for local_path, remote_path in files.items():
-            if not os.path.exists(local_path):
-                logger.error(f"[调试] 在uploadToFtp函数内部，文件 {local_path} 不存在！")
-                continue # 跳过这个不存在的文件
-            # Check if remote directory exists, create if not
-            remote_dir = os.path.dirname(remote_path)
-            try:
-                sftp.listdir(remote_dir)
-            except IOError:
-                # Create directory recursively
-                parts = remote_dir.split('/')
-                current_path = ''
-                for part in parts:
-                    if not part:
-                        continue
-                    current_path += f'{part}/'
+        with paramiko.Transport((sftp_config.host, sftp_config.port)) as transport:
+            transport.connect(username=sftp_config.username, password=sftp_config.password)
+            with paramiko.SFTPClient.from_transport(transport) as sftp:
+                for local_path, remote_path in files.items():
+                    if not os.path.exists(local_path):
+                        logger.error(f"[调试] 在uploadToFtp函数内部，文件 {local_path} 不存在！")
+                        continue # 跳过这个不存在的文件
+                    # Check if remote directory exists, create if not
+                    remote_dir = os.path.dirname(remote_path)
                     try:
-                        sftp.listdir(current_path)
+                        sftp.listdir(remote_dir)
                     except IOError:
-                        sftp.mkdir(current_path)
-            # Upload file
-            sftp.put(local_path, remote_path)
-            logger.info(f"[SFTP] File {local_path} uploaded to {remote_path}")
-        sftp.close()
-        transport.close()
+                        # Create directory recursively
+                        parts = remote_dir.split('/')
+                        current_path = ''
+                        for part in parts:
+                            if not part:
+                                continue
+                            current_path += f'{part}/'
+                            try:
+                                sftp.listdir(current_path)
+                            except IOError:
+                                sftp.mkdir(current_path)
+                    # Upload file
+                    sftp.put(local_path, remote_path)
+                    logger.info(f"[SFTP] File {local_path} uploaded to {remote_path}")
     except Exception as e:
-        logger.error(f"[SFTP] Failed to upload file: {str(e)}")
+        logger.error(f"FTP upload failed: {e}")
+        raise
+    finally:
+        if 'transport' in locals():
+            transport.close()
+            logger.info("FTP connection closed")
