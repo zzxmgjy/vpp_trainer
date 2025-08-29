@@ -32,7 +32,7 @@ class LstmService:
                 continue
 
             # 构建训练数据文件路径
-            data_file = f"{data_dir}/{station_id}/data/data-{station_id}-all.csv"
+            data_file = f"{data_dir}/{station_id}/data/all/data-{station_id}-all.csv"
             
             logger.info(f"开始训练场站 {station_id}，数据文件: {data_file}")
             

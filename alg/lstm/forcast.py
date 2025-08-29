@@ -488,7 +488,7 @@ def predict_power(station_id, start_datetime, model_base_path=None, data_path=No
             except Exception as e:
                 logger.error(f"读取历史数据失败: {e}")
                 # 尝试读取全部数据
-                all_data_path = os.path.join(station_dir, 'data', f'data-{station_id}-all.csv')
+                all_data_path = os.path.join(station_dir, 'data', 'all', f'data-{station_id}-all.csv')
                 if os.path.exists(all_data_path):
                     past_data = pd.read_csv(all_data_path)
                 else:
@@ -500,7 +500,7 @@ def predict_power(station_id, start_datetime, model_base_path=None, data_path=No
                 past_data = pd.read_csv(past_data_path)
             else:
                 # 尝试读取全部数据
-                all_data_path = os.path.join(station_dir, 'data', f'data-{station_id}-all.csv')
+                all_data_path = os.path.join(station_dir, 'data', 'all', f'data-{station_id}-all.csv')
                 if os.path.exists(all_data_path):
                     past_data = pd.read_csv(all_data_path)
                 else:
