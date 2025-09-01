@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # =========================================================
 #  单站点功率预测 —— Bi-Mamba4TS 简化版（使用过去7天+未来7天外部特征）
-#  - 训练策略：使用过去7天历史数据 + 未来7天已知外部特征（天气预报、节假日）
-#  - 过去7天：包含所有特征（负荷、天气、节假日等）
-#  - 未来7天：仅使用可预知的外部特征（天气预报、节假日、时间特征等）
-#  - 原始字段：time,quarter,holiday,is_peak,text,code,temperature,humidity,windSpeed,cloud,load,meter
+#  修改：
+#  1. 在 past window 加入历史目标通道（meter、load），未来窗口置 0；c_in += 2
+#  2. 给训练窗口加“近期采样权重/重采样”，比如最近 3/7/14 天提高采样概率。
+#  3. 早停/最优监控改为验证集 1-MAPE 分数（最大化）
+#  4. 评估时过滤了 y<=1，不过滤这个，只过滤0
 # =========================================================
 
 import os, warnings, time, argparse, gc
@@ -14,7 +15,7 @@ from sklearn.preprocessing import RobustScaler, LabelEncoder
 from sklearn.metrics      import mean_absolute_percentage_error, mean_squared_error
 import torch, torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data      import DataLoader, TensorDataset
+from torch.utils.data      import DataLoader, TensorDataset, WeightedRandomSampler
 from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
 from util.logger import logger
 import joblib
@@ -366,15 +367,14 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
         df['load'] = np.nan
     if 'meter' not in df.columns:
         df['meter'] = np.nan
-    # --- 不再使用 .fillna(0.0) ---
-    # df['load'] = df['load'].fillna(0.0)
-    # df['meter'] = df['meter'].fillna(0.0)
 
+    # 修改1: 加入历史目标通道（meter、load）到特征中
     feature_cols = ['quarter', 'holiday', 'is_peak', 'text', 'code', 'temperature', 'humidity', 'windSpeed', 'cloud',
-                    'day_of_week', 'day_of_month', 'day_of_year', 'week_of_year', 'hour', 'minute']
+                    'day_of_week', 'day_of_month', 'day_of_year', 'week_of_year', 'hour', 'minute', 'meter', 'load']
 
-    knowable_future_features = feature_cols.copy()
-    unknowable_future_features = []
+    knowable_future_features = ['quarter', 'holiday', 'is_peak', 'text', 'code', 'temperature', 'humidity', 'windSpeed', 'cloud',
+                                'day_of_week', 'day_of_month', 'day_of_year', 'week_of_year', 'hour', 'minute']
+    unknowable_future_features = ['meter', 'load']
 
     logger.info(f"使用原始特征: {feature_cols}")
     logger.info(f"特征总数: {len(feature_cols)}")
@@ -387,7 +387,7 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
         return
 
     # Scaler 拟合时会忽略NaN，这是正确的行为
-    sc_e=RobustScaler().fit(train_df[feature_cols])
+    sc_e=RobustScaler().fit(train_df[feature_cols].fillna(0.0))
     sc_y_p=RobustScaler().fit(train_df[['meter']])
     sc_y_n=RobustScaler().fit(train_df[['load']])
 
@@ -408,9 +408,9 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
         X, Yp, Yn, Mask_p, Mask_n = [], [], [], [], []
         for i in range(len(data) - total_len + 1):
             past_data = data.iloc[i : i + past]
-            past_features = sc_e.transform(past_data[historical_features])
+            past_features = sc_e.transform(past_data[historical_features]).astype(np.float32)
             future_data = data.iloc[i + past : i + total_len]
-            future_all_features = sc_e.transform(future_data[feature_cols])
+            future_all_features = sc_e.transform(future_data[feature_cols]).astype(np.float32)
             future_features = future_all_features.copy()
             for j, col in enumerate(feature_cols):
                 if col not in future_external_features:
@@ -450,8 +450,24 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
     assert X_tr.shape[1] == CFG['past_steps'] + CFG['future_steps'], "训练窗口长度不匹配！"
     assert X_va.shape[1] == CFG['past_steps'] + CFG['future_steps'], "验证窗口长度不匹配！"
 
+    # 修改2: 近期采样权重/重采样
+    # 计算最近3/7/14天的起始索引，并重复采样
+    total_len = CFG['past_steps'] + CFG['future_steps']
+    max_idx = len(train_df) - total_len
+    recent_3d_start = max(0, max_idx - 96*3 + 1)  # 最近3天窗口
+    recent_7d_start = max(0, max_idx - 96*7 + 1)  # 最近7天
+    recent_14d_start = max(0, max_idx - 96*14 + 1)  # 最近14天
+
+    # 权重计算
+    weights = np.ones(len(X_tr))
+    weights[recent_14d_start:] *= 5
+    weights[recent_7d_start:] *= 10
+    weights[recent_3d_start:] *= 20
+
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info("Device:", device)
+    logger.info(f"Device: {device}")
 
     # =========================================================
     # 6) 超参数优化 (可选)
@@ -459,6 +475,8 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
 
     # 如果启用超参数优化，先进行搜索
     if CFG.get('enable_hyperopt', False):
+        # 注意：若使用超参搜索，请确保 objective() 函数返回 vl_score，
+        # 并且 Optuna study 的 direction='maximize'
         from alg.lstm.incremental_training_new import apply_hyperparameter_optimization
 
         train_data = (X_tr, Yp_tr, Yn_tr, Mask_p_tr, Mask_n_tr)
@@ -480,13 +498,13 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
 
         # 重新创建数据加载器（如果batch_size改变）
         tr_ds = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(Yp_tr), torch.from_numpy(Yn_tr), torch.from_numpy(Mask_p_tr), torch.from_numpy(Mask_n_tr))
-        tr_loader = DataLoader(tr_ds, batch_size=CFG['batch_size'], shuffle=True, pin_memory=True)
+        tr_loader = DataLoader(tr_ds, batch_size=CFG['batch_size'], sampler=sampler, pin_memory=True)
 
         va_ds = TensorDataset(torch.from_numpy(X_va), torch.from_numpy(Yp_va), torch.from_numpy(Yn_va), torch.from_numpy(Mask_p_va), torch.from_numpy(Mask_n_va))
         va_loader = DataLoader(va_ds, batch_size=CFG['batch_size'], pin_memory=True)
     else:
         tr_ds = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(Yp_tr), torch.from_numpy(Yn_tr), torch.from_numpy(Mask_p_tr), torch.from_numpy(Mask_n_tr))
-        tr_loader = DataLoader(tr_ds, batch_size=CFG['batch_size'], shuffle=True, pin_memory=True)
+        tr_loader = DataLoader(tr_ds, batch_size=CFG['batch_size'], sampler=sampler, pin_memory=True)
 
         va_ds = TensorDataset(torch.from_numpy(X_va), torch.from_numpy(Yp_va), torch.from_numpy(Yn_va), torch.from_numpy(Mask_p_va), torch.from_numpy(Mask_n_va))
         va_loader = DataLoader(va_ds, batch_size=CFG['batch_size'], pin_memory=True)
@@ -522,7 +540,8 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
 
     patience = CFG['patience']
     wait = 0
-    best_val = float('inf')
+    # --- MODIFIED: 早停标准从最小化MAPE改为最大化分数 ---
+    best_score = -np.inf
     logger.info("开始训练 ...")
     epsilon = 1e-9 # 防止除以零
     for ep in range(1, CFG['epochs']+1):
@@ -555,33 +574,76 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
         tl = tl / max(1, n_batches)
 
         model.eval()
-        vl = 0.0; v_batches = 0
+        all_pp_va, all_pn_va = [], []
+        all_yp_va, all_yn_va = [], []
+        all_mask_p_va, all_mask_n_va = [], []
         with torch.no_grad():
-            # <--- MODIFIED: 从 loader 中解包出掩码 ---
             for xe, yp, yn, mask_p, mask_n in va_loader:
                 xe, yp, yn = xe.to(device), yp.to(device), yn.to(device)
-                mask_p, mask_n = mask_p.to(device), mask_n.to(device) # <--- ADDED
+                mask_p, mask_n = mask_p.to(device), mask_n.to(device)
                 with torch.cuda.amp.autocast(enabled=(device.type=='cuda')):
                     pp, pn = model(xe)
-                    # <--- MODIFIED: 使用掩码计算损失 ---
-                    loss_p_raw = crit(pp, yp)
-                    loss_n_raw = crit(pn, yn)
-                    loss_p_masked = loss_p_raw * mask_p
-                    loss_n_masked = loss_n_raw * mask_n
-                    loss_p = loss_p_masked.sum() / (mask_p.sum() + epsilon)
-                    loss_n = loss_n_masked.sum() / (mask_n.sum() + epsilon)
-                    vloss = CFG['power_weight'] * loss_p + CFG['not_use_power_weight'] * loss_n
-                vl += vloss.item(); v_batches += 1
-        vl = vl / max(1, v_batches)
+                all_pp_va.append(pp.cpu().numpy())
+                all_pn_va.append(pn.cpu().numpy())
+                all_yp_va.append(yp.cpu().numpy())
+                all_yn_va.append(yn.cpu().numpy())
+                all_mask_p_va.append(mask_p.cpu().numpy())
+                all_mask_n_va.append(mask_n.cpu().numpy())
+
+        # 反缩放并计算 MAPE
+        pred_p_va = sc_y_p.inverse_transform(np.concatenate(all_pp_va, axis=0)).flatten()
+        pred_n_va = sc_y_n.inverse_transform(np.concatenate(all_pn_va, axis=0)).flatten()
+        tgt_p_va = sc_y_p.inverse_transform(np.concatenate(all_yp_va, axis=0)).flatten()
+        tgt_n_va = sc_y_n.inverse_transform(np.concatenate(all_yn_va, axis=0)).flatten()
+        mask_p_va_flat = np.concatenate(all_mask_p_va, axis=0).flatten()
+        mask_n_va_flat = np.concatenate(all_mask_n_va, axis=0).flatten()
+
+        # 只在有效位置计算 MAPE
+        def calc_mape(y_true, y_pred, mask):
+            valid_mask = (mask > 0) & (~np.isnan(y_true)) & (y_true > 0)
+            if np.any(valid_mask):
+                return mean_absolute_percentage_error(y_true[valid_mask], y_pred[valid_mask]) * 100
+            return np.nan
+
+        # --- MODIFICATION START: 计算验证指标 ---
+        # 验证阶段计算分数与早停
+
+        # 反缩放后的验证集 MAPE（百分比）
+        p_mape_va = calc_mape(tgt_p_va, pred_p_va, mask_p_va_flat)
+        n_mape_va = calc_mape(tgt_n_va, pred_n_va, mask_n_va_flat)
+
+        # 1 - MAPE 分数，范围大致在 (-∞, 1]（当 MAPE>100% 时小于0）
+        p_score_va = 1.0 - (p_mape_va / 100.0) if not np.isnan(p_mape_va) else np.nan
+        n_score_va = 1.0 - (n_mape_va / 100.0) if not np.isnan(n_mape_va) else np.nan
+
+        # 加权组合分数 (与训练损失权重一致)
+        w_p, w_n = CFG['power_weight'], CFG['not_use_power_weight']
+        scores, weights = [], []
+        if not np.isnan(p_score_va):
+            scores.append(p_score_va)
+            weights.append(w_p)
+        if not np.isnan(n_score_va):
+            scores.append(n_score_va)
+            weights.append(w_n)
+
+        vl_score = (np.dot(scores, weights) / np.sum(weights)) if weights else -np.inf
+        if np.isnan(vl_score):
+            vl_score = -np.inf  # 防止全 NaN 时早停逻辑异常
 
         if sched_type != 'onecycle' and isinstance(scheduler, CosineAnnealingWarmRestarts):
             scheduler.step(ep)
 
+        # 日志里同时打印 MAPE 和 1-MAPE 分数
         if ep % 5 == 0 or ep == 1:
-            logger.info(f"Epoch {ep:03d}/{CFG['epochs']} | train_loss={tl:.6f} | val_loss={vl:.6f} | lr={opt.param_groups[0]['lr']:.2e}")
+            logger.info(f"Epoch {ep:03d}/{CFG['epochs']} | train_loss={tl:.6f} | "
+                        f"val_mape=({p_mape_va:.2f}%,{n_mape_va:.2f}%) | "
+                        f"val_score(1-MAPE)=({p_score_va:.3f},{n_score_va:.3f}) | "
+                        f"score_mean={vl_score:.3f} | lr={opt.param_groups[0]['lr']:.2e}")
 
-        if vl < best_val:
-            best_val = vl; wait = 0
+        # 早停从“最小化 MAPE”改为“最大化分数”
+        if vl_score > best_score:
+            best_score = vl_score
+            wait = 0
             torch.save(model.state_dict(), f"{out_dir}/bi_mamba.pth")
         else:
             wait += 1
@@ -610,20 +672,27 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
     tgt_n = hold_out.load.values
 
     def mape(y, yhat):
-        # 筛选出真实值大于1且非NaN的数据点进行评估
-        valid_mask = (~np.isnan(y)) & (y > 1.) # <--- MODIFIED
+        # 修改4: 只过滤0和NaN
+        valid_mask = (~np.isnan(y)) & (y > 0.)
         if np.any(valid_mask):
             return mean_absolute_percentage_error(y[valid_mask], yhat[valid_mask]) * 100
         return np.nan
 
+    # --- MODIFICATION START: Holdout 阶段同时输出 1-MAPE ---
     p_mape = mape(tgt_p, pred_p)
-    p_rmse = np.sqrt(mean_squared_error(tgt_p[~np.isnan(tgt_p)], pred_p[~np.isnan(tgt_p)]))
     n_mape = mape(tgt_n, pred_n)
-    n_rmse = np.sqrt(mean_squared_error(tgt_n[~np.isnan(tgt_n)], pred_n[~np.isnan(tgt_n)]))
+    p_score = 1.0 - (p_mape / 100.0) if not np.isnan(p_mape) else np.nan
+    n_score = 1.0 - (n_mape / 100.0) if not np.isnan(n_mape) else np.nan
+
+    idx_p = (~np.isnan(tgt_p)) & (tgt_p > 0)
+    p_rmse = np.sqrt(mean_squared_error(tgt_p[idx_p], pred_p[idx_p])) if np.any(idx_p) else np.nan
+    idx_n = (~np.isnan(tgt_n)) & (tgt_n > 0)
+    n_rmse = np.sqrt(mean_squared_error(tgt_n[idx_n], pred_n[idx_n])) if np.any(idx_n) else np.nan
 
     logger.info("\n--- 评估结果 ---")
-    logger.info(f"{station_id} 总功率 MAPE={p_mape:.2f}% RMSE={p_rmse:.2f}")
-    logger.info(f"{station_id} 负荷 MAPE={n_mape:.2f}% RMSE={n_rmse:.2f}")
+    logger.info(f"{station_id} 总功率 MAPE={p_mape:.2f}%  (1-MAPE)={p_score:.3f}  RMSE={p_rmse:.2f}")
+    logger.info(f"{station_id} 负荷   MAPE={n_mape:.2f}%  (1-MAPE)={n_score:.3f}  RMSE={n_rmse:.2f}")
+    # --- MODIFICATION END ---
 
     logger.info("\n--- 每日 MAPE ---")
     daily = {}
