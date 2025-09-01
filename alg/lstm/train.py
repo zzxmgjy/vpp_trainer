@@ -4,7 +4,7 @@
 #  修改：
 #  1. 在 past window 加入历史目标通道（meter、load），未来窗口置 0；c_in += 2
 #  2. 给训练窗口加“近期采样权重/重采样”，比如最近 3/7/14 天提高采样概率。
-#  3. 早停/最优监控改为验证集 MAPE
+#  3. 早停/最优监控改为验证集 1-MAPE 分数（最大化）
 #  4. 评估时过滤了 y<=1，不过滤这个，只过滤0
 # =========================================================
 
@@ -475,6 +475,8 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
 
     # 如果启用超参数优化，先进行搜索
     if CFG.get('enable_hyperopt', False):
+        # 注意：若使用超参搜索，请确保 objective() 函数返回 vl_score，
+        # 并且 Optuna study 的 direction='maximize'
         from alg.lstm.incremental_training_new import apply_hyperparameter_optimization
 
         train_data = (X_tr, Yp_tr, Yn_tr, Mask_p_tr, Mask_n_tr)
@@ -538,7 +540,8 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
 
     patience = CFG['patience']
     wait = 0
-    best_val_mape = float('inf')
+    # --- MODIFIED: 早停标准从最小化MAPE改为最大化分数 ---
+    best_score = -np.inf
     logger.info("开始训练 ...")
     epsilon = 1e-9 # 防止除以零
     for ep in range(1, CFG['epochs']+1):
@@ -602,18 +605,45 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
                 return mean_absolute_percentage_error(y_true[valid_mask], y_pred[valid_mask]) * 100
             return np.nan
 
+        # --- MODIFICATION START: 计算验证指标 ---
+        # 验证阶段计算分数与早停
+
+        # 反缩放后的验证集 MAPE（百分比）
         p_mape_va = calc_mape(tgt_p_va, pred_p_va, mask_p_va_flat)
         n_mape_va = calc_mape(tgt_n_va, pred_n_va, mask_n_va_flat)
-        vl_mape = np.nanmean([p_mape_va, n_mape_va])  # 平均 MAPE 作为监控指标
+
+        # 1 - MAPE 分数，范围大致在 (-∞, 1]（当 MAPE>100% 时小于0）
+        p_score_va = 1.0 - (p_mape_va / 100.0) if not np.isnan(p_mape_va) else np.nan
+        n_score_va = 1.0 - (n_mape_va / 100.0) if not np.isnan(n_mape_va) else np.nan
+
+        # 加权组合分数 (与训练损失权重一致)
+        w_p, w_n = CFG['power_weight'], CFG['not_use_power_weight']
+        scores, weights = [], []
+        if not np.isnan(p_score_va):
+            scores.append(p_score_va)
+            weights.append(w_p)
+        if not np.isnan(n_score_va):
+            scores.append(n_score_va)
+            weights.append(w_n)
+
+        vl_score = (np.dot(scores, weights) / np.sum(weights)) if weights else -np.inf
+        if np.isnan(vl_score):
+            vl_score = -np.inf  # 防止全 NaN 时早停逻辑异常
 
         if sched_type != 'onecycle' and isinstance(scheduler, CosineAnnealingWarmRestarts):
             scheduler.step(ep)
 
+        # 日志里同时打印 MAPE 和 1-MAPE 分数
         if ep % 5 == 0 or ep == 1:
-            logger.info(f"Epoch {ep:03d}/{CFG['epochs']} | train_loss={tl:.6f} | val_mape={vl_mape:.6f} | lr={opt.param_groups[0]['lr']:.2e}")
+            logger.info(f"Epoch {ep:03d}/{CFG['epochs']} | train_loss={tl:.6f} | "
+                        f"val_mape=({p_mape_va:.2f}%,{n_mape_va:.2f}%) | "
+                        f"val_score(1-MAPE)=({p_score_va:.3f},{n_score_va:.3f}) | "
+                        f"score_mean={vl_score:.3f} | lr={opt.param_groups[0]['lr']:.2e}")
 
-        if vl_mape < best_val_mape:
-            best_val_mape = vl_mape; wait = 0
+        # 早停从“最小化 MAPE”改为“最大化分数”
+        if vl_score > best_score:
+            best_score = vl_score
+            wait = 0
             torch.save(model.state_dict(), f"{out_dir}/bi_mamba.pth")
         else:
             wait += 1
@@ -648,16 +678,21 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
             return mean_absolute_percentage_error(y[valid_mask], yhat[valid_mask]) * 100
         return np.nan
 
+    # --- MODIFICATION START: Holdout 阶段同时输出 1-MAPE ---
     p_mape = mape(tgt_p, pred_p)
-    idx_p = (~np.isnan(tgt_p)) & (tgt_p > 0)
-    p_rmse = np.sqrt(mean_squared_error(tgt_p[idx_p], pred_p[idx_p]))
     n_mape = mape(tgt_n, pred_n)
+    p_score = 1.0 - (p_mape / 100.0) if not np.isnan(p_mape) else np.nan
+    n_score = 1.0 - (n_mape / 100.0) if not np.isnan(n_mape) else np.nan
+
+    idx_p = (~np.isnan(tgt_p)) & (tgt_p > 0)
+    p_rmse = np.sqrt(mean_squared_error(tgt_p[idx_p], pred_p[idx_p])) if np.any(idx_p) else np.nan
     idx_n = (~np.isnan(tgt_n)) & (tgt_n > 0)
-    n_rmse = np.sqrt(mean_squared_error(tgt_n[idx_n], pred_n[idx_n]))
+    n_rmse = np.sqrt(mean_squared_error(tgt_n[idx_n], pred_n[idx_n])) if np.any(idx_n) else np.nan
 
     logger.info("\n--- 评估结果 ---")
-    logger.info(f"{station_id} 总功率 MAPE={p_mape:.2f}% RMSE={p_rmse:.2f}")
-    logger.info(f"{station_id} 负荷 MAPE={n_mape:.2f}% RMSE={n_rmse:.2f}")
+    logger.info(f"{station_id} 总功率 MAPE={p_mape:.2f}%  (1-MAPE)={p_score:.3f}  RMSE={p_rmse:.2f}")
+    logger.info(f"{station_id} 负荷   MAPE={n_mape:.2f}%  (1-MAPE)={n_score:.3f}  RMSE={n_rmse:.2f}")
+    # --- MODIFICATION END ---
 
     logger.info("\n--- 每日 MAPE ---")
     daily = {}

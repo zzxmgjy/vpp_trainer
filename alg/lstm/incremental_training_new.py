@@ -9,6 +9,7 @@ import json
 import torch
 import numpy as np
 from util.logger import logger
+from sklearn.metrics import mean_absolute_percentage_error
 
 try:
     import optuna
@@ -185,7 +186,8 @@ class HyperparameterOptimizer:
         self.device = device
         self.out_dir = out_dir
         self.best_params = None
-        self.best_score = float('inf')
+        # --- MODIFIED: 初始化为负无穷，因为我们要最大化分数 ---
+        self.best_score = -np.inf
 
     def objective(self, trial):
         """Optuna目标函数"""
@@ -226,14 +228,16 @@ class HyperparameterOptimizer:
                 'not_use_power_weight': not_use_power_weight,
             }
 
-            # 训练模型并返回验证损失
-            val_loss = self._train_with_config(config, trial)
+            # --- MODIFIED: 训练模型并返回验证分数 ---
+            val_score = self._train_with_config(config, trial)
+            return val_score
 
-            return val_loss
-
+        except optuna.exceptions.TrialPruned:
+            raise
         except Exception as e:
             logger.info(f" Trial {trial.number} 失败: {e}")
-            return float('inf')
+            # --- MODIFIED: 返回一个极差的分数 ---
+            return -np.inf
 
     def _train_with_config(self, config, trial):
         """使用给定配置训练模型"""
@@ -255,151 +259,130 @@ class HyperparameterOptimizer:
             batch_size=config['batch_size'], pin_memory=True
         )
 
-        # 创建模型
         model = BiMambaPowerModel(
-            c_in=len(self.feature_cols),
-            seq_len=CFG['past_steps'],
-            pred_len=CFG['future_steps'],
-            patch_len=config['patch_len'],
-            stride=config['stride'],
-            d_model=config['d_model'],
-            n_layers=config['n_layers'],
-            d_ff=config['d_ff'],
-            dropout=config['drop_rate'],
-            d_state=config['d_state'],
-            d_conv=config['d_conv'],
-            expand=config['expand'],
+            c_in=len(self.feature_cols), seq_len=CFG['past_steps'], pred_len=CFG['future_steps'],
+            patch_len=config['patch_len'], stride=config['stride'], d_model=config['d_model'],
+            n_layers=config['n_layers'], d_ff=config['d_ff'], dropout=config['drop_rate'],
+            d_state=config['d_state'], d_conv=config['d_conv'], expand=config['expand'],
             bidirectional=CFG['bidirectional']
         ).to(self.device)
 
-        # 损失函数和优化器
-        wvec_simple = np.ones(CFG['future_steps']) # 或使用 train.py 中的 default_weight_vector
+        wvec_simple = np.ones(CFG['future_steps'])
         criterion = WeightedSmoothL1(CFG['future_steps'], wvec_simple).to(self.device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config['lr'], weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+        # --- MODIFIED: 调度器监控分数，模式为 'max' ---
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5, factor=0.5)
 
-        # 训练循环（缩短版本用于超参数搜索）
-        max_epochs = 20  # 减少epoch数以加速搜索
+        max_epochs = 20
         patience = 15
-        best_val_loss = float('inf')
-        patience_counter = 0
-        epsilon = 1e-9  # 防止除以零
+        # --- MODIFIED: 跟踪最佳分数 ---
+        best_val_score = -np.inf
+        epsilon = 1e-9
+
+        def calc_mape(y_true, y_pred, mask):
+            valid_mask = (mask > 0) & (~np.isnan(y_true)) & (y_true > 0)
+            if np.any(valid_mask):
+                return mean_absolute_percentage_error(y_true[valid_mask], y_pred[valid_mask]) * 100
+            return np.nan
 
         for epoch in range(1, max_epochs + 1):
-            # 训练
             model.train()
             train_loss = 0.0
-
             for xe, yp, yn, mask_p, mask_n in tr_loader:
                 xe, yp, yn = xe.to(self.device), yp.to(self.device), yn.to(self.device)
                 mask_p, mask_n = mask_p.to(self.device), mask_n.to(self.device)
-
                 optimizer.zero_grad()
                 pp, pn = model(xe)
-
-                # 使用掩码计算损失
                 loss_p_raw = criterion(pp, yp)
                 loss_n_raw = criterion(pn, yn)
-                loss_p_masked = loss_p_raw * mask_p
-                loss_n_masked = loss_n_raw * mask_n
-                loss_p = loss_p_masked.sum() / (mask_p.sum() + epsilon)
-                loss_n = loss_n_masked.sum() / (mask_n.sum() + epsilon)
+                loss_p = (loss_p_raw * mask_p).sum() / (mask_p.sum() + epsilon)
+                loss_n = (loss_n_raw * mask_n).sum() / (mask_n.sum() + epsilon)
                 loss = config['power_weight'] * loss_p + config['not_use_power_weight'] * loss_n
-
                 loss.backward()
                 optimizer.step()
                 train_loss += loss.item()
-
             train_loss /= len(tr_loader)
 
-            # 验证
+            # --- MODIFICATION START: 验证逻辑改为计算 1-MAPE 分数 ---
             model.eval()
-            val_loss = 0.0
-
+            all_pp_va, all_pn_va, all_yp_va, all_yn_va, all_mask_p_va, all_mask_n_va = [], [], [], [], [], []
             with torch.no_grad():
                 for xe, yp, yn, mask_p, mask_n in va_loader:
-                    xe, yp, yn = xe.to(self.device), yp.to(self.device), yn.to(self.device)
-                    mask_p, mask_n = mask_p.to(self.device), mask_n.to(self.device)
+                    pp, pn = model(xe.to(self.device))
+                    all_pp_va.append(pp.cpu().numpy())
+                    all_pn_va.append(pn.cpu().numpy())
+                    all_yp_va.append(yp.numpy())
+                    all_yn_va.append(yn.numpy())
+                    all_mask_p_va.append(mask_p.numpy())
+                    all_mask_n_va.append(mask_n.numpy())
 
-                    pp, pn = model(xe)
+            sc_y_p = self.scalers['y_power']; sc_y_n = self.scalers['y_not_use']
+            pred_p_va = sc_y_p.inverse_transform(np.concatenate(all_pp_va)).flatten()
+            pred_n_va = sc_y_n.inverse_transform(np.concatenate(all_pn_va)).flatten()
+            tgt_p_va = sc_y_p.inverse_transform(np.concatenate(all_yp_va)).flatten()
+            tgt_n_va = sc_y_n.inverse_transform(np.concatenate(all_yn_va)).flatten()
+            mask_p_va_flat = np.concatenate(all_mask_p_va).flatten()
+            mask_n_va_flat = np.concatenate(all_mask_n_va).flatten()
 
-                    # 使用掩码计算损失
-                    loss_p_raw = criterion(pp, yp)
-                    loss_n_raw = criterion(pn, yn)
-                    loss_p_masked = loss_p_raw * mask_p
-                    loss_n_masked = loss_n_raw * mask_n
-                    loss_p = loss_p_masked.sum() / (mask_p.sum() + epsilon)
-                    loss_n = loss_n_masked.sum() / (mask_n.sum() + epsilon)
-                    vloss = config['power_weight'] * loss_p + config['not_use_power_weight'] * loss_n
+            p_mape_va = calc_mape(tgt_p_va, pred_p_va, mask_p_va_flat)
+            n_mape_va = calc_mape(tgt_n_va, pred_n_va, mask_n_va_flat)
+            p_score_va = 1.0 - (p_mape_va / 100.0) if not np.isnan(p_mape_va) else np.nan
+            n_score_va = 1.0 - (n_mape_va / 100.0) if not np.isnan(n_mape_va) else np.nan
 
-                    val_loss += vloss.item()
+            w_p, w_n = config['power_weight'], config['not_use_power_weight']
+            scores, weights = [], []
+            if not np.isnan(p_score_va): scores.append(p_score_va); weights.append(w_p)
+            if not np.isnan(n_score_va): scores.append(n_score_va); weights.append(w_n)
+            vl_score = (np.dot(scores, weights) / np.sum(weights)) if weights else -np.inf
+            if np.isnan(vl_score): vl_score = -np.inf
 
-            val_loss /= len(va_loader)
-            scheduler.step(val_loss)
-            logger.info(f"[Trial {trial.number}] Epoch {epoch:02d} | train {train_loss:.5f} | valid {val_loss:.5f}")
-            # 早停检查
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            scheduler.step(vl_score)
+            logger.info(f"[Trial {trial.number}] Epoch {epoch:02d} | train {train_loss:.5f} | valid_score {vl_score:.5f}")
+
+            if vl_score > best_val_score:
+                best_val_score = vl_score
                 patience_counter = 0
             else:
                 patience_counter += 1
-                if patience_counter >= patience:
-                    break
+                if patience_counter >= patience: break
 
-            # Optuna剪枝
-            trial.report(val_loss, epoch)
+            trial.report(vl_score, epoch)
             if trial.should_prune():
                 raise optuna.exceptions.TrialPruned()
+            # --- MODIFICATION END ---
 
-        return best_val_loss
+        return best_val_score
 
     def optimize(self, n_trials: int = 100, timeout: int = 3600, enable_pruning: bool = True):
         """执行超参数优化"""
         if not OPTUNA_AVAILABLE:
             logger.info(" Optuna未安装，无法进行超参数优化")
-            return None
+            return None, -np.inf
 
         logger.info(f" 开始超参数搜索 (试验次数: {n_trials}, 超时: {timeout}s)")
 
-        # 创建study
         pruner = MedianPruner() if enable_pruning else None
         sampler = TPESampler(seed=42)
 
+        # --- MODIFIED: 优化方向改为 'maximize' ---
         study = optuna.create_study(
-            direction='minimize',
+            direction='maximize',
             pruner=pruner,
             sampler=sampler
         )
 
-        # 执行优化
-        study.optimize(
-            self.objective,
-            n_trials=n_trials,
-            timeout=timeout,
-            show_progress_bar=True
-        )
+        study.optimize(self.objective, n_trials=n_trials, timeout=timeout, show_progress_bar=True)
 
-        # 保存结果
         self.best_params = study.best_params
         self.best_score = study.best_value
 
-        # 保存优化结果
-        results = {
-            'best_params': self.best_params,
-            'best_score': self.best_score,
-            'n_trials': len(study.trials),
-            'optimization_history': [
-                {'trial': i, 'value': trial.value, 'params': trial.params}
-                for i, trial in enumerate(study.trials)
-                if trial.value is not None
-            ]
-        }
-
+        results = {'best_params': self.best_params, 'best_score': self.best_score, 'n_trials': len(study.trials)}
         with open(f"{self.out_dir}/hyperopt_results.json", 'w') as f:
             json.dump(results, f, indent=2)
 
         logger.info(f" 超参数优化完成!")
-        logger.info(f"最佳验证损失: {self.best_score:.5f}")
+        # --- MODIFIED: 日志输出改为分数 ---
+        logger.info(f"最佳验证分数: {self.best_score:.5f}")
         logger.info(f"最佳参数: {self.best_params}")
 
         return self.best_params, self.best_score
@@ -410,61 +393,41 @@ def apply_incremental_training(model, train_loader, val_loader, criterion, devic
     if not cfg.get('incremental_training', False):
         return model
 
-    logger.info("\n" + "="*50)
-    logger.info(" 启动增量微调模式")
-    logger.info("="*50)
+    logger.info("\n" + "="*50); logger.info(" 启动增量微调模式"); logger.info("="*50)
 
     trainer = IncrementalTrainer(model, device, out_dir)
-
-    # 尝试加载预训练模型
     pretrained_path = f"{out_dir}/bi_mamba.pth"
     if trainer.load_pretrained_weights(pretrained_path):
-        # 执行增量训练
         finetune_lr = cfg['lr'] * cfg.get('finetune_lr_ratio', 0.1)
-
         trainer.incremental_train(
-            train_loader=train_loader,
-            val_loader=val_loader,
-            criterion=criterion,
-            finetune_lr=finetune_lr,
-            finetune_epochs=cfg.get('finetune_epochs', 50),
+            train_loader=train_loader, val_loader=val_loader, criterion=criterion,
+            finetune_lr=finetune_lr, finetune_epochs=cfg.get('finetune_epochs', 50),
             finetune_patience=cfg.get('finetune_patience', 15),
             freeze_layers=cfg.get('freeze_backbone_layers', 2)
         )
-
-        # 加载微调后的最佳模型
         finetuned_path = f"{out_dir}/bi_mamba.pth"
         if os.path.exists(finetuned_path):
             model.load_state_dict(torch.load(finetuned_path, map_location=device))
             logger.info(" 已加载微调后的最佳模型")
     else:
         logger.info("  未找到预训练模型，跳过增量微调")
-
     return model
 
 
 def apply_hyperparameter_optimization(train_data, val_data, feature_cols, scalers, device, out_dir, cfg):
     """应用超参数优化"""
     if not cfg.get('enable_hyperopt', False):
-        return None
+        return None, -np.inf
 
-    logger.info("\n" + "="*50)
-    logger.info(" 启动自动超参数调优")
-    logger.info("="*50)
+    logger.info("\n" + "="*50); logger.info(" 启动自动超参数调优"); logger.info("="*50)
 
     optimizer = HyperparameterOptimizer(
-        train_data=train_data,
-        val_data=val_data,
-        feature_cols=feature_cols,
-        scalers=scalers,
-        device=device,
-        out_dir=out_dir
+        train_data=train_data, val_data=val_data, feature_cols=feature_cols,
+        scalers=scalers, device=device, out_dir=out_dir
     )
-
     best_params, best_score = optimizer.optimize(
         n_trials=cfg.get('n_trials', 10),
         timeout=cfg.get('optuna_timeout', 3600),
         enable_pruning=cfg.get('optuna_pruning', True)
     )
-
     return best_params, best_score
