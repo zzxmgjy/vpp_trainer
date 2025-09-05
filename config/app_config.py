@@ -82,6 +82,14 @@ class AppConfig:
         else:
             return os.path.join(os.getcwd(), model_dir)
 
+    def get_history_model_dir(self):
+        history_model_dir = self.dir.history_model
+        p = Path(history_model_dir)
+        if p.is_absolute():
+            return history_model_dir
+        else:
+            return os.path.join(os.getcwd(), history_model_dir)
+
     def getFtpUploadModelDir(self):
         sftp = self.sftp
         if sftp and sftp.host and sftp.upload_model_dir:
