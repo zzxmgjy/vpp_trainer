@@ -14,14 +14,15 @@ class LightgbmService:
     @staticmethod
     def train_by_lightgbm(customer_number: str = None,start_date: str = None, end_date: str = None, update_model: bool = None):
         model_dir = config.get_model_dir()
+        his_model_dir = config.get_history_model_dir()
         data_dir = config.get_data_dir()
         logger.info(f"data_dir dir is {data_dir}")
         csv_dir = Path(f"{data_dir}/{customer_number}/data")
         meter_model_path = Path(f"{model_dir}/{customer_number}/lightgbm/meter.pkl")
         load_model_path = Path(f"{model_dir}/{customer_number}/lightgbm/load.pkl")
         time_str = datetime.now().strftime("%Y-%m-%d-%H%M")
-        meter_model_his_path = Path(f"{model_dir}/{customer_number}/lightgbm/his/meter-{time_str}.pkl")
-        load_model_his_path = Path(f"{model_dir}/{customer_number}/lightgbm/his/load-{time_str}.pkl")
+        meter_model_his_path = Path(f"{his_model_dir}/{customer_number}/lightgbm/meter-{time_str}.pkl")
+        load_model_his_path = Path(f"{his_model_dir}/{customer_number}/lightgbm/load-{time_str}.pkl")
         start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
         end_datetime = datetime.strptime(end_date, "%Y-%m-%d")
         actual_months = list(iter_months(start_datetime, end_datetime))
@@ -57,6 +58,7 @@ class LightgbmService:
     def train_all_lightgbm():
         try:
             model_dir = config.get_model_dir()
+            his_model_dir = config.get_history_model_dir()
             data_dir = config.get_data_dir()
             upload_dir = config.getFtpUploadModelDir()
             logger.info(f"data_dir dir is {data_dir}")
@@ -70,8 +72,8 @@ class LightgbmService:
                 meter_model_path = Path(f"{model_dir}/{customer_number}/lightgbm/meter.pkl")
                 load_model_path = Path(f"{model_dir}/{customer_number}/lightgbm/load.pkl")
                 time_str = datetime.now().strftime("%Y-%m-%d-%H%M")
-                meter_model_his_path = Path(f"{model_dir}/{customer_number}/lightgbm/his/meter-{time_str}.pkl")
-                load_model_his_path = Path(f"{model_dir}/{customer_number}/lightgbm/his/load-{time_str}.pkl")
+                meter_model_his_path = Path(f"{his_model_dir}/{customer_number}/lightgbm/meter-{time_str}.pkl")
+                load_model_his_path = Path(f"{his_model_dir}/{customer_number}/lightgbm/load-{time_str}.pkl")
                 train_data = pd.DataFrame()
                 path = Path(csv_dir)
                 for month_data_path in path.glob("*.csv"):
