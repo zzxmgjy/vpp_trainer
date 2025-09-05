@@ -26,6 +26,7 @@ class LoggingConfig:
 class DirConfig:
     data: str
     model: str
+    history_model: str
 
 @dataclass
 class SftpConfig:
