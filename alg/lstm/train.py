@@ -246,7 +246,7 @@ feature_cols = None
 # =========================================================
 # 主流程
 # =========================================================
-def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=False, enable_incremental=False, args_cli=None, output_path=None, model_base_path=None):
+def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=False, enable_incremental=False, args_cli=None, output_path=None, model_base_path=None,history_model_dir=None):
     global feature_cols
     tic=time.time()
     #赋值超参数调优
@@ -268,6 +268,8 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
             output_path = root_config['output'].get('path', 'output')
         if model_base_path is None:
             model_base_path = root_config['output'].get('model_path', 'model')
+        if history_model_dir is None:
+            history_model_dir = root_config['output'].get('model_path', 'model')
 
     if station_id:
         # 创建模型保存路径
@@ -275,7 +277,7 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
         os.makedirs(model_save_dir, exist_ok=True)
 
         # 检查目录中是否已有文件，如果有则移动到历史模型目录
-        history_dir = f"{model_base_path}/{station_id}/history/lstm"
+        history_dir = f"{history_model_dir}/{station_id}/history/lstm"
         os.makedirs(history_dir, exist_ok=True)
 
         if os.path.exists(model_save_dir) and os.listdir(model_save_dir):

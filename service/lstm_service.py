@@ -14,6 +14,8 @@ class LstmService:
         model_dir = config.get_model_dir()
         #获取到数据文件目录
         data_dir = config.get_data_dir()
+        #获取到历史模型文件目录
+        history_model_dir = config.get_history_model_dir()
         #获取所有场站id
         station_ids = []
         for item in os.listdir(data_dir):
@@ -39,7 +41,7 @@ class LstmService:
             try:
                 # 直接调用train.py中的main方法，传递路径参数
                 main(station_id=station_id, data_file=data_file, enable_hyperopt=True,
-                     output_path=data_dir, model_base_path=model_dir)
+                     output_path=data_dir, model_base_path=model_dir,history_model_dir=history_model_dir)
                 logger.info(f"场站 {station_id} 训练任务完成")
             except Exception as e:
                 logger.error(f"场站 {station_id} 训练任务失败: {e}")
