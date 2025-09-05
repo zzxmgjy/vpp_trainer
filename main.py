@@ -55,7 +55,7 @@ def forecast_model():
 scheduler = BackgroundScheduler()
 scheduler.add_job(
     dowload_data,
-    trigger=CronTrigger(hour=config.cron["data"].hour, minute=config.cron["data"].minute),
+    trigger=CronTrigger(minute=config.cron["data"].minute),
     name="download_data"
 )
 scheduler.add_job(

@@ -6,8 +6,7 @@ server:
 cron:
   # download data from SFTP server
   data:
-    hour: 1
-    minute: 1
+    minute: 15
   # train model
   train:
     hour: 1
@@ -19,8 +18,7 @@ cron:
     minute: 30
   # forecast model
   forecast:
-    hour: 0
-    minute: 15
+    minute: 20
 logging:
   dir: "logs"
   file: "training.log"
