@@ -11,8 +11,8 @@ class ServerConfig:
 
 @dataclass
 class CronConfig:
-    hour: Optional[int] = None
-    minute: int
+    hour: int = 0
+    minute: int = 0
     day: Optional[int] = None #添加可选的 day 字段
 @dataclass
 class LoggingConfig:
