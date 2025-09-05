@@ -32,7 +32,8 @@ dir:
 
   # dir: "/Users/yang/git/vpp_cloud_forcast/model" # Configurable absolute path
   model: "model" # Configurable relative path, the model directory is the current directory where the Python code is executed
-
+  history_mode: "history_model" 
+  
 sftp:
   host: "192.168.0.222" # empty if no need to upload/download
   port: 22345
