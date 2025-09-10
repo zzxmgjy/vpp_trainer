@@ -81,6 +81,9 @@ class LightgbmService:
                             train_data,
                             month_data
                         ])
+                    if train_data.empty:
+                        logger.error(f"[train_all_lightgbm][{customer_number}] no data")
+                        continue
                     meter_model = train_meter(train_data)
                     save_model(meter_model_path, meter_model)
                     save_model(meter_model_his_path, meter_model)
