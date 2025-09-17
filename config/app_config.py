@@ -13,7 +13,9 @@ class ServerConfig:
 class CronConfig:
     hour: int = 0
     minute: int = 0
-    day: Optional[int] = None #添加可选的 day 字段
+    day: Optional[int] = None
+    mode: str = "daily"  # 支持 "daily", "weekly", "monthly", "custom"
+    custom_cron: Optional[str] = None  # 自定义 cron 表达式
 @dataclass
 class LoggingConfig:
     dir: str

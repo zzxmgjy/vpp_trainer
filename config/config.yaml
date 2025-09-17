@@ -13,9 +13,12 @@ cron:
     minute: 30
   # train lstm model
   trainLstm:
-    day: 1
+    mode: "monthly"  # 支持 "weekly", "monthly", "custom"
+    day: 1           # monthly: 每月第几天, weekly: 周几(0=周一,6=周日), custom: 自定义
     hour: 1
     minute: 30
+    # 可选：自定义 cron 表达式
+    # custom_cron: "0 30 1 1 *"  # 当 mode 为 "custom" 时使用
   # forecast model
   forecast:
     minute: 20

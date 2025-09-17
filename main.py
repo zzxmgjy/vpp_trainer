@@ -8,6 +8,7 @@ import uvicorn
 from util.ftp import downloadFromFtp
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from util.scheduler_helper import SchedulerHelper
 from service.lightgbm_service import LightgbmService
 from service.prophet_service import ProphetService
 from service.lstm_service import LstmService
@@ -63,10 +64,15 @@ scheduler.add_job(
     trigger=CronTrigger(hour=config.cron["train"].hour, minute=config.cron["train"].minute),
     name="daily_train"
 )
+# 使用调度器辅助类创建灵活的调度触发器
+lstm_trigger = SchedulerHelper.create_trigger(config.cron["trainLstm"])
+lstm_description = SchedulerHelper.get_schedule_description(config.cron["trainLstm"])
+logger.info(f"LSTM 模型训练调度: {lstm_description}")
+
 scheduler.add_job(
     train_lstm_model,
-    trigger=CronTrigger(day=config.cron["trainLstm"].day,hour=config.cron["trainLstm"].hour, minute=config.cron["trainLstm"].minute),
-    name="month_train"
+    trigger=lstm_trigger,
+    name="lstm_train"
 )
 scheduler.add_job(
     forecast_model,
