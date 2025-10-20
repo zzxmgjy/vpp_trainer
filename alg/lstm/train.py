@@ -555,175 +555,102 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
         )
 
     # =========================================================
-    # 模型创建 & 训练
+    # 模型创建 & 训练 (替换为 AutoTS 框架)
     # =========================================================
-    model=BiMambaPowerModel(c_in=len(feature_cols), seq_len=CFG['past_steps'], pred_len=CFG['future_steps'], patch_len=CFG['patch_len'], stride=CFG['stride'],
-                            d_model=CFG['d_model'], n_layers=CFG['n_layers'], d_ff=CFG['d_ff'], dropout=CFG['drop_rate'], d_state=CFG['d_state'],
-                            d_conv=CFG['d_conv'], expand=CFG['expand'], bidirectional=CFG['bidirectional']).to(device)
+    try:
+        from autots import AutoTS
+    except Exception as e:
+        logger.error(f"AutoTS 未安装或导入失败: {e}")
+        return
 
-    def default_weight_vector(fut):
-        w = np.concatenate([np.ones(96*2)*2.0, np.ones(96)*1.3, np.ones(96)*1.5, np.ones(96*3)*1.2])
-        return w[:fut]
+    # 仅使用未来可知的外部特征作为回归量
+    regressor_cols = [c for c in feature_cols if c in knowable_future_features]
 
-    if horizon_weights_csv:
-        try:
-            wvec = np.array([float(x) for x in horizon_weights_csv.split(',')], dtype=float)[:CFG['future_steps']]
-        except Exception as e:
-            wvec = default_weight_vector(CFG['future_steps'])
-    else:
-        wvec = default_weight_vector(CFG['future_steps'])
+    # AutoTS 默认参数，可通过超参模块覆盖
+    AUTOTS_DEFAULT = {
+        'ensemble': 'simple',
+        'max_generations': 8,
+        'num_validations': 2,
+        'validation_method': 'backwards',
+        'model_list': 'fast',
+        'n_jobs': 'auto',
+        'prediction_interval': 0.9,
+    }
+    # 如果上游超参搜索返回了 autots_params，则进行覆盖
+    autots_params = AUTOTS_DEFAULT.copy()
+    _bp = locals().get('best_params', None)
+    if isinstance(_bp, dict) and 'autots_params' in _bp:
+        autots_params.update(_bp['autots_params'] or {})
 
-    crit = WeightedSmoothL1(CFG['future_steps'], wvec).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=max_lr, weight_decay=weight_decay)
-    scheduler = None
-    if sched_type == 'onecycle':
-        steps_per_epoch = max(1, len(tr_loader))
-        scheduler = OneCycleLR(opt, max_lr=max_lr, steps_per_epoch=steps_per_epoch, epochs=CFG['epochs'], pct_start=0.1, anneal_strategy='cos')
-    else:
-        scheduler = CosineAnnealingWarmRestarts(opt, T_0=10, T_mult=1, eta_min=max_lr*1e-3)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type=='cuda'))
+    # 构建训练数据与回归量（meter）
+    meter_train = train_df[['energy_date', 'meter']].dropna(subset=['meter']).copy()
+    meter_reg_train = train_df.loc[meter_train.index, regressor_cols].copy()
+    meter_reg_future = hold_out[regressor_cols].reset_index(drop=True).copy()
 
-    patience = CFG['patience']
-    wait = 0
-    # --- MODIFIED: 早停标准从最小化MAPE改为最大化分数 ---
-    best_score = -np.inf
-    logger.info("开始训练 ...")
-    epsilon = 1e-9 # 防止除以零
-    for ep in range(1, CFG['epochs']+1):
-        model.train()
-        tl = 0.0
-        n_batches = 0
-        # <--- MODIFIED: 从 loader 中解包出掩码 ---
-        for xe, yp, yn, mask_p, mask_n in tr_loader:
-            xe, yp, yn = xe.to(device), yp.to(device), yn.to(device)
-            mask_p, mask_n = mask_p.to(device), mask_n.to(device) # <--- ADDED: 移动掩码到设备
+    # 构建训练数据与回归量（load）
+    load_train = train_df[['energy_date', 'load']].dropna(subset=['load']).copy()
+    load_reg_train = train_df.loc[load_train.index, regressor_cols].copy()
+    load_reg_future = hold_out[regressor_cols].reset_index(drop=True).copy()
 
-            opt.zero_grad()
-            with torch.cuda.amp.autocast(enabled=(device.type=='cuda')):
-                pp, pn = model(xe)
-                # <--- MODIFIED: 使用掩码计算损失 ---
-                loss_p_raw = crit(pp, yp)
-                loss_n_raw = crit(pn, yn)
-                loss_p_masked = loss_p_raw * mask_p
-                loss_n_masked = loss_n_raw * mask_n
-                loss_p = loss_p_masked.sum() / (mask_p.sum() + epsilon)
-                loss_n = loss_n_masked.sum() / (mask_n.sum() + epsilon)
-                loss = CFG['power_weight'] * loss_p + CFG['not_use_power_weight'] * loss_n
+    logger.info("开始使用 AutoTS 训练模型 ...")
 
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-            if sched_type == 'onecycle' and isinstance(scheduler, OneCycleLR):
-                scheduler.step()
-            tl += loss.item(); n_batches += 1
-        tl = tl / max(1, n_batches)
+    # 训练 meter 模型
+    model_meter = AutoTS(
+        forecast_length=CFG['future_steps'],
+        frequency='infer',
+        prediction_interval=autots_params['prediction_interval'],
+        ensemble=autots_params['ensemble'],
+        max_generations=autots_params['max_generations'],
+        num_validations=autots_params['num_validations'],
+        validation_method=autots_params['validation_method'],
+        model_list=autots_params['model_list'],
+        n_jobs=autots_params.get('n_jobs', 'auto'),
+        verbose=0,
+    )
+    model_meter = model_meter.fit(
+        data=meter_train,
+        date_col='energy_date',
+        value_col='meter',
+        id_col=None,
+        future_regressor=meter_reg_train,
+    )
+    pred_meter = model_meter.predict(future_regressor=meter_reg_future)
+    pred_p = pred_meter.forecast.iloc[:, 0].values.astype(float)
 
-        model.eval()
-        all_pp_va, all_pn_va = [], []
-        all_yp_va, all_yn_va = [], []
-        all_mask_p_va, all_mask_n_va = [], []
-        with torch.no_grad():
-            for xe, yp, yn, mask_p, mask_n in va_loader:
-                xe, yp, yn = xe.to(device), yp.to(device), yn.to(device)
-                mask_p, mask_n = mask_p.to(device), mask_n.to(device)
-                with torch.cuda.amp.autocast(enabled=(device.type=='cuda')):
-                    pp, pn = model(xe)
-                all_pp_va.append(pp.cpu().numpy())
-                all_pn_va.append(pn.cpu().numpy())
-                all_yp_va.append(yp.cpu().numpy())
-                all_yn_va.append(yn.cpu().numpy())
-                all_mask_p_va.append(mask_p.cpu().numpy())
-                all_mask_n_va.append(mask_n.cpu().numpy())
+    # 训练 load 模型
+    model_load = AutoTS(
+        forecast_length=CFG['future_steps'],
+        frequency='infer',
+        prediction_interval=autots_params['prediction_interval'],
+        ensemble=autots_params['ensemble'],
+        max_generations=autots_params['max_generations'],
+        num_validations=autots_params['num_validations'],
+        validation_method=autots_params['validation_method'],
+        model_list=autots_params['model_list'],
+        n_jobs=autots_params.get('n_jobs', 'auto'),
+        verbose=0,
+    )
+    model_load = model_load.fit(
+        data=load_train,
+        date_col='energy_date',
+        value_col='load',
+        id_col=None,
+        future_regressor=load_reg_train,
+    )
+    pred_load = model_load.predict(future_regressor=load_reg_future)
+    pred_n = pred_load.forecast.iloc[:, 0].values.astype(float)
 
-        # 反缩放并计算 MAPE
-        pred_p_va = sc_y_p.inverse_transform(np.concatenate(all_pp_va, axis=0)).flatten()
-        pred_n_va = sc_y_n.inverse_transform(np.concatenate(all_pn_va, axis=0)).flatten()
-        tgt_p_va = sc_y_p.inverse_transform(np.concatenate(all_yp_va, axis=0)).flatten()
-        tgt_n_va = sc_y_n.inverse_transform(np.concatenate(all_yn_va, axis=0)).flatten()
-        mask_p_va_flat = np.concatenate(all_mask_p_va, axis=0).flatten()
-        mask_n_va_flat = np.concatenate(all_mask_n_va, axis=0).flatten()
-
-        # 只在有效位置计算 MAPE
-        def calc_mape(y_true, y_pred, mask):
-            valid_mask = (mask > 0) & (~np.isnan(y_true)) & (y_true > 0)
-            if np.any(valid_mask):
-                return mean_absolute_percentage_error(y_true[valid_mask], y_pred[valid_mask]) * 100
-            return np.nan
-
-        # --- MODIFICATION START: 计算验证指标 ---
-        # 验证阶段计算分数与早停
-
-        # 反缩放后的验证集 MAPE（百分比）
-        p_mape_va = calc_mape(tgt_p_va, pred_p_va, mask_p_va_flat)
-        n_mape_va = calc_mape(tgt_n_va, pred_n_va, mask_n_va_flat)
-
-        # 1 - MAPE 分数，范围大致在 (-∞, 1]（当 MAPE>100% 时小于0）
-        p_score_va = 1.0 - (p_mape_va / 100.0) if not np.isnan(p_mape_va) else np.nan
-        n_score_va = 1.0 - (n_mape_va / 100.0) if not np.isnan(n_mape_va) else np.nan
-
-        # 加权组合分数 (与训练损失权重一致)
-        w_p, w_n = CFG['power_weight'], CFG['not_use_power_weight']
-        scores, weights = [], []
-        if not np.isnan(p_score_va):
-            scores.append(p_score_va)
-            weights.append(w_p)
-        if not np.isnan(n_score_va):
-            scores.append(n_score_va)
-            weights.append(w_n)
-
-        vl_score = (np.dot(scores, weights) / np.sum(weights)) if weights else -np.inf
-        if np.isnan(vl_score):
-            vl_score = -np.inf  # 防止全 NaN 时早停逻辑异常
-
-        if sched_type != 'onecycle' and isinstance(scheduler, CosineAnnealingWarmRestarts):
-            scheduler.step(ep)
-
-        # 日志里同时打印 MAPE 和 1-MAPE 分数
-        if ep % 5 == 0 or ep == 1:
-            logger.info(f"Epoch {ep:03d}/{CFG['epochs']} | train_loss={tl:.6f} | "
-                        f"val_mape=({p_mape_va:.2f}%,{n_mape_va:.2f}%) | "
-                        f"val_score(1-MAPE)=({p_score_va:.3f},{n_score_va:.3f}) | "
-                        f"score_mean={vl_score:.3f} | lr={opt.param_groups[0]['lr']:.2e}")
-
-        # 早停从“最小化 MAPE”改为“最大化分数”
-        if vl_score > best_score:
-            best_score = vl_score
-            wait = 0
-            torch.save(model.state_dict(), f"{out_dir}/bi_mamba.pth")
-        else:
-            wait += 1
-            if wait >= patience:
-                logger.info("触发早停 (patience reached).")
-                break
-
-    logger.info("\n--- 保留集评估 ---")
-    if os.path.exists(os.path.join(out_dir, 'bi_mamba.pth')):
-        model.load_state_dict(torch.load(os.path.join(out_dir, 'bi_mamba.pth'), map_location=device))
-    model.eval()
-
-    total_input_len = CFG['past_steps'] + CFG['future_steps']
-    # <--- MODIFIED: 解包时用 _ 忽略不需要的掩码和目标值 ---
-    X_test, _, _, _, _ = build_windows_local(df.iloc[-total_input_len:], CFG['past_steps'], CFG['future_steps'])
-    assert X_test.shape[1] == total_input_len, "测试窗口长度不匹配！"
-    xe_realistic = torch.tensor(X_test, dtype=torch.float32).to(device)
-
-    with torch.no_grad():
-        with torch.cuda.amp.autocast(enabled=(device.type=='cuda')):
-            pp_realistic, pn_realistic = model(xe_realistic)
-
-    pred_p = sc_y_p.inverse_transform(pp_realistic.cpu().numpy()).flatten()
-    pred_n = sc_y_n.inverse_transform(pn_realistic.cpu().numpy()).flatten()
+    # 真实目标
     tgt_p = hold_out.meter.values
     tgt_n = hold_out.load.values
 
     def mape(y, yhat):
-        # 修改4: 只过滤0和NaN
         valid_mask = (~np.isnan(y)) & (y > 0.)
         if np.any(valid_mask):
             return mean_absolute_percentage_error(y[valid_mask], yhat[valid_mask]) * 100
         return np.nan
 
-    # --- MODIFICATION START: Holdout 阶段同时输出 1-MAPE ---
+    # --- 评估 ---
     p_mape = mape(tgt_p, pred_p)
     n_mape = mape(tgt_n, pred_n)
     p_score = 1.0 - (p_mape / 100.0) if not np.isnan(p_mape) else np.nan
@@ -737,7 +664,6 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
     logger.info("\n--- 评估结果 ---")
     logger.info(f"{station_id} 总功率 MAPE={p_mape:.2f}%  (1-MAPE)={p_score:.3f}  RMSE={p_rmse:.2f}")
     logger.info(f"{station_id} 负荷   MAPE={n_mape:.2f}%  (1-MAPE)={n_score:.3f}  RMSE={n_rmse:.2f}")
-    # --- MODIFICATION END ---
 
     logger.info("\n--- 每日 MAPE ---")
     daily = {}
@@ -754,14 +680,15 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
 
     # 保存模型到指定路径
     if station_id:
-        # 保存模型和相关文件到指定路径
         model_save_dir = f"{model_base_path}/{station_id}/lstm"
-        torch.save(model.state_dict(), f"{model_save_dir}/bi_mamba.pth")
-        joblib.dump(sc_e, os.path.join(model_save_dir, 'scaler_enc.pkl'))
-        joblib.dump(sc_y_p, os.path.join(model_save_dir, 'scaler_y_power.pkl'))
-        joblib.dump(sc_y_n, os.path.join(model_save_dir, 'scaler_y_not_use.pkl'))
+        # 保存 AutoTS 模型
+        joblib.dump(model_meter, os.path.join(model_save_dir, 'autots_meter.pkl'))
+        joblib.dump(model_load, os.path.join(model_save_dir, 'autots_load.pkl'))
+        # 仍然保存特征和配置，保持原有逻辑
         joblib.dump(feature_cols, os.path.join(model_save_dir, 'enc_cols.pkl'))
         joblib.dump({'knowable_future_features': knowable_future_features, 'unknowable_future_features': unknowable_future_features}, os.path.join(model_save_dir, 'feature_classification.pkl'))
+        # 保存 AutoTS 参数到配置中
+        CFG['autots_params'] = autots_params
         joblib.dump(CFG, os.path.join(model_save_dir, 'config.pkl'))
         joblib.dump({'overall': {'power_mape': p_mape, 'load_mape': n_mape}, 'daily': daily}, os.path.join(model_save_dir, 'mape.pkl'))
 

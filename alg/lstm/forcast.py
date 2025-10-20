@@ -385,17 +385,17 @@ def predict_power(station_id, start_datetime, model_base_path=None, data_path=No
 
         # 加载模型和相关文件（带简单缓存）
         try:
-            # 设置设备
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            logger.info(f"使用设备: {device}")
-            global USE_FALLBACK_MAMBA
-            if not torch.cuda.is_available():
-                USE_FALLBACK_MAMBA = True
-                logger.info("强制使用Fallback Mamba实现")
+            # 直接加载 AutoTS 模型与配置
+            cache_key = str(station_id)
+            meter_model_path = os.path.join(model_dir, 'autots_meter.pkl')
+            load_model_path = os.path.join(model_dir, 'autots_load.pkl')
+            config_path_file = os.path.join(model_dir, 'config.pkl')
 
-            cache_key = (str(station_id), device.type)
-            model_path = os.path.join(model_dir, 'bi_mamba.pth')
-            model_mtime = os.path.getmtime(model_path) if os.path.exists(model_path) else None
+            if not (os.path.exists(meter_model_path) and os.path.exists(load_model_path) and os.path.exists(config_path_file)):
+                logger.error("缺少必要的 AutoTS 模型或配置文件")
+                return []
+
+            model_mtime = max(os.path.getmtime(p) for p in [meter_model_path, load_model_path, config_path_file])
             bundle = _MODEL_CACHE.get(cache_key)
 
             if bundle and bundle.get('mtime') == model_mtime:
@@ -403,12 +403,10 @@ def predict_power(station_id, start_datetime, model_base_path=None, data_path=No
                 expected_features = bundle['expected_features']
                 knowable_future_features = bundle['knowable_future_features']
                 unknowable_future_features = bundle['unknowable_future_features']
-                sc_e = bundle['sc_e']
-                sc_y_p = bundle['sc_y_p']
-                sc_y_n = bundle['sc_y_n']
                 model_config = bundle['model_config']
-                model = bundle['model']
-                logger.info("复用缓存的模型与资源")
+                model_meter = bundle['model_meter']
+                model_load = bundle['model_load']
+                logger.info("复用缓存的 AutoTS 模型与资源")
             else:
                 # 加载特征列表
                 feature_cols = joblib.load(os.path.join(model_dir, 'enc_cols.pkl'))
@@ -420,57 +418,21 @@ def predict_power(station_id, start_datetime, model_base_path=None, data_path=No
                 feature_classification = joblib.load(os.path.join(model_dir, 'feature_classification.pkl'))
                 knowable_future_features = feature_classification.get('knowable_future_features', expected_features)
                 unknowable_future_features = feature_classification.get('unknowable_future_features', [])
-                sc_e = joblib.load(os.path.join(model_dir, 'scaler_enc.pkl'))
-                sc_y_p = joblib.load(os.path.join(model_dir, 'scaler_y_power.pkl'))
-                sc_y_n = joblib.load(os.path.join(model_dir, 'scaler_y_not_use.pkl'))
-                model_config = joblib.load(os.path.join(model_dir, 'config.pkl'))
+                model_config = joblib.load(config_path_file)
 
-                model = BiMambaPowerModel(
-                    c_in=len(feature_cols),
-                    seq_len=model_config['past_steps'],
-                    pred_len=model_config['future_steps'],
-                    patch_len=model_config['patch_len'],
-                    stride=model_config['stride'],
-                    d_model=model_config['d_model'],
-                    n_layers=model_config['n_layers'],
-                    d_ff=model_config['d_ff'],
-                    dropout=model_config['drop_rate'],
-                    d_state=model_config['d_state'],
-                    d_conv=model_config['d_conv'],
-                    expand=model_config['expand'],
-                    bidirectional=model_config.get('bidirectional', True)
-                )
+                # 加载 AutoTS 模型
+                model_meter = joblib.load(meter_model_path)
+                model_load = joblib.load(load_model_path)
 
-                # 加载模型权重，确保正确的设备映射
-                try:
-                    if torch.cuda.is_available() and not USE_FALLBACK_MAMBA:
-                        model.load_state_dict(torch.load(model_path))
-                        model = model.to(device)
-                        logger.info("模型已加载到CUDA设备")
-                    else:
-                        state_dict = torch.load(model_path, map_location='cpu')
-                        model.load_state_dict(state_dict, strict=False)
-                        model = model.cpu()
-                except Exception as e:
-                    logger.error(f"加载模型权重失败: {e}")
-                    state_dict = torch.load(model_path, map_location='cpu')
-                    model.load_state_dict(state_dict, strict=False)
-                    model = model.cpu()
-                    USE_FALLBACK_MAMBA = True
-                    logger.info("强制在CPU上加载模型，使用Fallback实现")
-
-                model.eval()
                 _MODEL_CACHE[cache_key] = {
                     'mtime': model_mtime,
                     'feature_cols': feature_cols,
                     'expected_features': expected_features,
                     'knowable_future_features': knowable_future_features,
                     'unknowable_future_features': unknowable_future_features,
-                    'sc_e': sc_e,
-                    'sc_y_p': sc_y_p,
-                    'sc_y_n': sc_y_n,
                     'model_config': model_config,
-                    'model': model,
+                    'model_meter': model_meter,
+                    'model_load': model_load,
                 }
 
         except Exception as e:
@@ -624,45 +586,22 @@ def predict_power(station_id, start_datetime, model_base_path=None, data_path=No
             for feature in missing_features:
                 combined_data[feature] = 0.0
 
-        # 提取特征（简化处理）
+        # 提取特征（AutoTS无需缩放，这里仅确保列存在）
+        feature_data = combined_data[feature_cols].copy()
+
+        # 5. 进行预测（AutoTS）
         try:
-            # 确保特征数据类型正确
-            feature_data = combined_data[feature_cols].copy()
-            for col in feature_cols:
-                feature_data[col] = pd.to_numeric(feature_data[col], errors='coerce')
-                # --- MODIFIED: 只对非 NaN 值进行填充，保持与训练时的一致性 ---
-                # 对于特征列，将 NaN 填充为 0（因为 scaler 在训练时会忽略 NaN）
-                feature_data[col] = feature_data[col].fillna(0)
+            # 仅使用未来可知特征作为回归量
+            regressor_cols = [c for c in feature_cols if c in knowable_future_features]
+            future_regressor = combined_data[regressor_cols].iloc[past_steps:past_steps+future_steps].reset_index(drop=True)
 
-            X = sc_e.transform(feature_data)
-            X = np.array([X], dtype=np.float32)  # 添加批次维度
+            pred_power_df = model_meter.predict(future_regressor=future_regressor)
+            pred_load_df = model_load.predict(future_regressor=future_regressor)
+            pred_power = pred_power_df.forecast.iloc[:, 0].values.astype(float)
+            pred_load = pred_load_df.forecast.iloc[:, 0].values.astype(float)
         except Exception as e:
-            logger.error(f"转换特征时出错: {e}")
+            logger.error(f"AutoTS 预测失败: {e}")
             return []
-
-        # 5. 进行预测
-        with torch.no_grad():
-            X_tensor = torch.tensor(X, dtype=torch.float32)
-            # 确保模型和数据在同一设备上
-            if torch.cuda.is_available():
-                X_tensor = X_tensor.to(device)
-                model = model.to(device)
-            else:
-                # 如果没有CUDA，确保模型在CPU上
-                model = model.cpu()
-                X_tensor = X_tensor.cpu()
-                device = torch.device('cpu')
-
-            # 只在有CUDA时使用autocast
-            if device.type == 'cuda':
-                with torch.cuda.amp.autocast():
-                    pred_power, pred_load = model(X_tensor)
-            else:
-                pred_power, pred_load = model(X_tensor)
-
-        # 6. 转换预测结果
-        pred_power = sc_y_p.inverse_transform(pred_power.cpu().numpy()).flatten()
-        pred_load = sc_y_n.inverse_transform(pred_load.cpu().numpy()).flatten()
 
         # 7. 构建结果数据
         # 确保时间列存在

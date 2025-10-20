@@ -16,4 +16,5 @@ scikit-learn
 joblib
 optuna
 Prophet
+autots
 plotly
