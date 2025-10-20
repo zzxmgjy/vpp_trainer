@@ -15,6 +15,10 @@ from sklearn.preprocessing import RobustScaler, LabelEncoder
 from sklearn.metrics      import mean_absolute_percentage_error, mean_squared_error
 import torch, torch.nn as nn
 import torch.nn.functional as F
+try:
+    torch.set_float32_matmul_precision('high')
+except Exception:
+    pass
 from torch.utils.data      import DataLoader, TensorDataset, WeightedRandomSampler
 from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
 from util.logger import logger
@@ -76,27 +80,22 @@ except Exception:
         def __init__(self, d_model, d_state=16, d_conv=4, expand=2, use_fast_path=True):
             super().__init__()
             self.d_model = d_model
-            self.d_state = d_state
             self.expand_dim = int(expand * d_model)
             self.in_proj = nn.Linear(d_model, self.expand_dim * 2)
-            self.conv = nn.Conv1d(self.expand_dim, self.expand_dim, d_conv, padding=d_conv-1, groups=self.expand_dim)
-            self.A = nn.Parameter(torch.randn(self.expand_dim, d_state) * 0.01)
-            self.C = nn.Parameter(torch.randn(self.expand_dim, d_state) * 0.01)
-            self.D = nn.Parameter(torch.ones(self.expand_dim) * 0.01)
+            # 深度可分离卷积（近似 Mamba 的局部混合，避免逐步循环）
+            pad = max(0, d_conv // 2)
+            self.dw_conv = nn.Conv1d(self.expand_dim, self.expand_dim, d_conv, padding=pad, groups=self.expand_dim)
+            self.pw = nn.Linear(self.expand_dim, self.expand_dim)
             self.out_proj = nn.Linear(self.expand_dim, d_model)
-        def forward(self, x):
+            self.act = nn.SiLU()
+            self.gate = nn.Sigmoid()
+        def forward(self, x):  # x: [B,L,D]
             B, L, _ = x.shape
-            x_and_z = self.in_proj(x)
-            x_proj, z = x_and_z.chunk(2, dim=-1)
-            x_conv = self.conv(x_proj.transpose(1,2))[:, :, :L].transpose(1,2)
-            x_s4 = torch.zeros_like(x_conv)
-            h = torch.zeros(B, self.A.shape[1], device=x.device)
-            for i in range(L):
-                u = torch.einsum('be,ed->bd', x_conv[:, i], self.A)
-                h = torch.tanh(u + h)
-                s4_out = torch.einsum('bd,ed->be', h, self.C) + self.D * x_conv[:, i]
-                x_s4[:, i] = s4_out
-            y = torch.sigmoid(z) * x_s4
+            x_proj, z = self.in_proj(x).chunk(2, dim=-1)
+            # 卷积期望 [B,C,L]
+            y = self.dw_conv(x_proj.transpose(1, 2))[:, :, :L].transpose(1, 2)
+            y = self.act(self.pw(y))
+            y = y * self.gate(z)
             return self.out_proj(y)
 
 # ---------- 配置 ----------
@@ -396,39 +395,45 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
     # <--- MODIFIED: 函数现在返回 X, Yp, Yn, Mask_p, Mask_n ---
     def build_windows_local(data, past, fut):
         """
-        构建训练窗口：
+        构建训练窗口（性能优化版）：
         - 过去7天的历史数据（包括负荷数据）
         - 未来7天的已知外部特征（天气预报、节假日等，不包括负荷数据）
+        说明：将特征标准化操作提前到循环外，避免对每个窗口重复调用 scaler.transform。
         """
         total_len = past + fut
 
-        # 分离历史特征和未来外部特征
-        # 历史特征：包含所有特征（包括负荷相关）
-        historical_features = feature_cols.copy()
+        # 预先计算整段数据的标准化特征，减少循环中的重复计算
+        # 注意：与原逻辑保持一致，不对 NaN 进行额外填充
+        enc_all = sc_e.transform(data[feature_cols]).astype(np.float32)
+
+        # 未来窗口中需要置零的列（例如 meter/load），使用列索引以便快速操作
         future_external_features = knowable_future_features
+        zero_col_idx = [j for j, col in enumerate(feature_cols) if col not in future_external_features]
+
+        # 目标与掩码所需的原始值（避免在循环内频繁 DataFrame 切片）
+        meter_vals = data['meter'].values if 'meter' in data.columns else np.full(len(data), np.nan)
+        load_vals  = data['load'].values  if 'load'  in data.columns else np.full(len(data), np.nan)
 
         X, Yp, Yn, Mask_p, Mask_n = [], [], [], [], []
-        for i in range(len(data) - total_len + 1):
-            past_data = data.iloc[i : i + past]
-            past_features = sc_e.transform(past_data[historical_features]).astype(np.float32)
-            future_data = data.iloc[i + past : i + total_len]
-            future_all_features = sc_e.transform(future_data[feature_cols]).astype(np.float32)
-            future_features = future_all_features.copy()
-            for j, col in enumerate(feature_cols):
-                if col not in future_external_features:
-                    future_features[:, j] = 0.0
-            combined_features = np.vstack([past_features, future_features])
-            X.append(combined_features)
+        max_start = len(data) - total_len + 1
+        for i in range(max_start):
+            # 过去部分：直接切片已标准化后的特征
+            past_enc = enc_all[i : i + past]
+            # 未来部分：切片后仅复制这一小段，并将未知未来特征置零
+            fut_enc = enc_all[i + past : i + total_len].copy()
+            if zero_col_idx:
+                fut_enc[:, zero_col_idx] = 0.0
+            # 合并过去和未来的特征
+            X.append(np.vstack([past_enc, fut_enc]))
 
-            # --- ADDED: 创建目标值和掩码 ---
-            yp_slice = future_data[['meter']].values
-            yn_slice = future_data[['load']].values
+            # 目标与掩码（未来部分）
+            yp_slice = meter_vals[i + past : i + total_len].reshape(-1, 1)
+            yn_slice = load_vals[i + past : i + total_len].reshape(-1, 1)
 
-            # 掩码: 1.0 代表有效值, 0.0 代表 NaN
-            mask_p = 1.0 - pd.isna(yp_slice).astype(float)
-            mask_n = 1.0 - pd.isna(yn_slice).astype(float)
+            mask_p = (~np.isnan(yp_slice)).astype(np.float32)
+            mask_n = (~np.isnan(yn_slice)).astype(np.float32)
 
-            # 用0替换NaN，因为它们不会参与损失计算
+            # 对目标进行缩放，NaN 在变换后仍可能为 NaN，后续使用 nan_to_num 置零以配合掩码
             Yp.append(np.nan_to_num(sc_y_p.transform(yp_slice)).flatten())
             Yn.append(np.nan_to_num(sc_y_n.transform(yn_slice)).flatten())
             Mask_p.append(mask_p.flatten())
@@ -437,12 +442,12 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
         X = np.array(X, dtype=np.float32)
         Yp = np.array(Yp, dtype=np.float32)
         Yn = np.array(Yn, dtype=np.float32)
-        Mask_p = np.array(Mask_p, dtype=np.float32) # <--- ADDED
-        Mask_n = np.array(Mask_n, dtype=np.float32) # <--- ADDED
+        Mask_p = np.array(Mask_p, dtype=np.float32)
+        Mask_n = np.array(Mask_n, dtype=np.float32)
 
         if X.shape[0] > 0:
             assert X.shape[1] == total_len, f"窗口长度错误: got {X.shape[1]}, expected {total_len}"
-        return X, Yp, Yn, Mask_p, Mask_n # <--- MODIFIED
+        return X, Yp, Yn, Mask_p, Mask_n
 
     # <--- MODIFIED: 解包出掩码 ---
     X_tr, Yp_tr, Yn_tr, Mask_p_tr, Mask_n_tr = build_windows_local(train_df, CFG['past_steps'], CFG['future_steps'])
@@ -470,6 +475,18 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
 
     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Device: {device}")
+    if device.type == 'cuda':
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+    pin_memory_flag = (device.type == 'cuda')
+    # 适度增加 DataLoader 并行度以提升数据供给性能
+    try:
+        cpu_cnt = os.cpu_count() or 1
+    except Exception:
+        cpu_cnt = 1
+    num_workers = max(1, min(8, cpu_cnt // 2))
 
     # =========================================================
     # 6) 超参数优化 (可选)
@@ -500,16 +517,42 @@ def main(station_id=None, data_file='merged_station_test.csv', enable_hyperopt=F
 
         # 重新创建数据加载器（如果batch_size改变）
         tr_ds = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(Yp_tr), torch.from_numpy(Yn_tr), torch.from_numpy(Mask_p_tr), torch.from_numpy(Mask_n_tr))
-        tr_loader = DataLoader(tr_ds, batch_size=CFG['batch_size'], sampler=sampler, pin_memory=True)
+        tr_loader = DataLoader(
+            tr_ds,
+            batch_size=CFG['batch_size'],
+            sampler=sampler,
+            pin_memory=pin_memory_flag,
+            num_workers=num_workers,
+            persistent_workers=True
+        )
 
         va_ds = TensorDataset(torch.from_numpy(X_va), torch.from_numpy(Yp_va), torch.from_numpy(Yn_va), torch.from_numpy(Mask_p_va), torch.from_numpy(Mask_n_va))
-        va_loader = DataLoader(va_ds, batch_size=CFG['batch_size'], pin_memory=True)
+        va_loader = DataLoader(
+            va_ds,
+            batch_size=CFG['batch_size'],
+            pin_memory=pin_memory_flag,
+            num_workers=num_workers,
+            persistent_workers=True
+        )
     else:
         tr_ds = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(Yp_tr), torch.from_numpy(Yn_tr), torch.from_numpy(Mask_p_tr), torch.from_numpy(Mask_n_tr))
-        tr_loader = DataLoader(tr_ds, batch_size=CFG['batch_size'], sampler=sampler, pin_memory=True)
+        tr_loader = DataLoader(
+            tr_ds,
+            batch_size=CFG['batch_size'],
+            sampler=sampler,
+            pin_memory=pin_memory_flag,
+            num_workers=num_workers,
+            persistent_workers=True
+        )
 
         va_ds = TensorDataset(torch.from_numpy(X_va), torch.from_numpy(Yp_va), torch.from_numpy(Yn_va), torch.from_numpy(Mask_p_va), torch.from_numpy(Mask_n_va))
-        va_loader = DataLoader(va_ds, batch_size=CFG['batch_size'], pin_memory=True)
+        va_loader = DataLoader(
+            va_ds,
+            batch_size=CFG['batch_size'],
+            pin_memory=pin_memory_flag,
+            num_workers=num_workers,
+            persistent_workers=True
+        )
 
     # =========================================================
     # 模型创建 & 训练

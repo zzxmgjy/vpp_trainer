@@ -8,6 +8,10 @@ import os
 import numpy as np
 import pandas as pd
 import torch
+try:
+    torch.set_float32_matmul_precision('high')
+except Exception:
+    pass
 import joblib
 import yaml
 import datetime
@@ -61,33 +65,26 @@ except Exception:
     USE_FALLBACK_MAMBA = True
     logger.warning("mamba_ssm 未找到，使用脚本内 fallback Mamba")
 
-# 定义fallback Mamba实现
+# 定义fallback Mamba实现（向量化近似，避免逐步循环）
 class FallbackMamba(torch.nn.Module):
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2, use_fast_path=True):
         super().__init__()
         self.d_model = d_model
-        self.d_state = d_state
         self.expand_dim = int(expand * d_model)
         self.in_proj = torch.nn.Linear(d_model, self.expand_dim * 2)
-        self.conv = torch.nn.Conv1d(self.expand_dim, self.expand_dim, d_conv, padding=d_conv-1, groups=self.expand_dim)
-        self.A = torch.nn.Parameter(torch.randn(self.expand_dim, d_state) * 0.01)
-        self.C = torch.nn.Parameter(torch.randn(self.expand_dim, d_state) * 0.01)
-        self.D = torch.nn.Parameter(torch.ones(self.expand_dim) * 0.01)
+        pad = max(0, d_conv // 2)
+        self.dw_conv = torch.nn.Conv1d(self.expand_dim, self.expand_dim, d_conv, padding=pad, groups=self.expand_dim)
+        self.pw = torch.nn.Linear(self.expand_dim, self.expand_dim)
         self.out_proj = torch.nn.Linear(self.expand_dim, d_model)
+        self.act = torch.nn.SiLU()
+        self.gate = torch.nn.Sigmoid()
 
-    def forward(self, x):
+    def forward(self, x):  # x: [B,L,D]
         B, L, _ = x.shape
-        x_and_z = self.in_proj(x)
-        x_proj, z = x_and_z.chunk(2, dim=-1)
-        x_conv = self.conv(x_proj.transpose(1,2))[:, :, :L].transpose(1,2)
-        x_s4 = torch.zeros_like(x_conv)
-        h = torch.zeros(B, self.A.shape[1], device=x.device)
-        for i in range(L):
-            u = torch.einsum('be,ed->bd', x_conv[:, i], self.A)
-            h = torch.tanh(u + h)
-            s4_out = torch.einsum('bd,ed->be', h, self.C) + self.D * x_conv[:, i]
-            x_s4[:, i] = s4_out
-        y = torch.sigmoid(z) * x_s4
+        x_proj, z = self.in_proj(x).chunk(2, dim=-1)
+        y = self.dw_conv(x_proj.transpose(1, 2))[:, :, :L].transpose(1, 2)
+        y = self.act(self.pw(y))
+        y = y * self.gate(z)
         return self.out_proj(y)
 
 # 根据环境选择Mamba实现
@@ -95,6 +92,9 @@ if USE_FALLBACK_MAMBA:
     Mamba = FallbackMamba
 else:
     Mamba = MambaSSM
+
+# 简单的进程内缓存（按站点与设备类型区分）
+_MODEL_CACHE = {}
 
 # 定义模型架构
 class Patching(torch.nn.Module):
@@ -383,89 +383,95 @@ def predict_power(station_id, start_datetime, model_base_path=None, data_path=No
             logger.error(f"模型目录不存在: {model_dir}")
             return []
 
-        # 加载模型和相关文件
+        # 加载模型和相关文件（带简单缓存）
         try:
-            # 加载特征列表
-            feature_cols = joblib.load(os.path.join(model_dir, 'enc_cols.pkl'))
-
-            # 确保特征列表包含所有必要的时间特征（与train_a.py保持一致）
-            expected_features = ['quarter', 'holiday', 'is_peak', 'text', 'code', 'temperature', 'humidity', 'windSpeed', 'cloud',
-                                 'day_of_week', 'day_of_month', 'day_of_year', 'week_of_year', 'hour', 'minute']
-
-            # 如果加载的特征列表不完整，使用预期的特征列表
-            if not all(f in feature_cols for f in expected_features):
-                logger.warning(f"加载的特征列表不完整，使用预期的特征列表: {expected_features}")
-                feature_cols = expected_features
-
-            # 加载特征分类
-            feature_classification = joblib.load(os.path.join(model_dir, 'feature_classification.pkl'))
-            knowable_future_features = feature_classification.get('knowable_future_features', expected_features)
-            unknowable_future_features = feature_classification.get('unknowable_future_features', [])
-
-            # 加载缩放器
-            sc_e = joblib.load(os.path.join(model_dir, 'scaler_enc.pkl'))
-            sc_y_p = joblib.load(os.path.join(model_dir, 'scaler_y_power.pkl'))
-            sc_y_n = joblib.load(os.path.join(model_dir, 'scaler_y_not_use.pkl'))
-
-            # 加载配置
-            model_config = joblib.load(os.path.join(model_dir, 'config.pkl'))
-
-            # 加载模型
+            # 设置设备
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             logger.info(f"使用设备: {device}")
-
-            # 如果没有CUDA，强制使用fallback实现
             global USE_FALLBACK_MAMBA
-            logger.info(f"使用Fallback Mamba: {USE_FALLBACK_MAMBA}")
-
             if not torch.cuda.is_available():
                 USE_FALLBACK_MAMBA = True
                 logger.info("强制使用Fallback Mamba实现")
 
-            model = BiMambaPowerModel(
-                c_in=len(feature_cols),
-                seq_len=model_config['past_steps'],
-                pred_len=model_config['future_steps'],
-                patch_len=model_config['patch_len'],
-                stride=model_config['stride'],
-                d_model=model_config['d_model'],
-                n_layers=model_config['n_layers'],
-                d_ff=model_config['d_ff'],
-                dropout=model_config['drop_rate'],
-                d_state=model_config['d_state'],
-                d_conv=model_config['d_conv'],
-                expand=model_config['expand'],
-                bidirectional=model_config.get('bidirectional', True)
-            )
+            cache_key = (str(station_id), device.type)
+            model_path = os.path.join(model_dir, 'bi_mamba.pth')
+            model_mtime = os.path.getmtime(model_path) if os.path.exists(model_path) else None
+            bundle = _MODEL_CACHE.get(cache_key)
 
-            # 加载模型权重，确保正确的设备映射
-            try:
-                if torch.cuda.is_available() and not USE_FALLBACK_MAMBA:
-                    model.load_state_dict(torch.load(os.path.join(model_dir, 'bi_mamba.pth')))
-                    model = model.to(device)
-                    logger.info("模型已加载到CUDA设备")
-                else:
-                    # 在CPU上加载CUDA训练的模型
-                    state_dict = torch.load(os.path.join(model_dir, 'bi_mamba.pth'), map_location='cpu')
-                    model.load_state_dict(state_dict, strict=False)  # 使用strict=False以忽略不匹配的层
-                    model = model.cpu()
-                    device = torch.device('cpu')
-                    logger.info("模型已加载到CPU设备，使用Fallback实现")
-            except Exception as e:
-                logger.error(f"加载模型权重失败: {e}")
-                # 尝试强制在CPU上加载，忽略不匹配的层
+            if bundle and bundle.get('mtime') == model_mtime:
+                feature_cols = bundle['feature_cols']
+                expected_features = bundle['expected_features']
+                knowable_future_features = bundle['knowable_future_features']
+                unknowable_future_features = bundle['unknowable_future_features']
+                sc_e = bundle['sc_e']
+                sc_y_p = bundle['sc_y_p']
+                sc_y_n = bundle['sc_y_n']
+                model_config = bundle['model_config']
+                model = bundle['model']
+                logger.info("复用缓存的模型与资源")
+            else:
+                # 加载特征列表
+                feature_cols = joblib.load(os.path.join(model_dir, 'enc_cols.pkl'))
+                expected_features = ['quarter','holiday','is_peak','text','code','temperature','humidity','windSpeed','cloud',
+                                     'day_of_week','day_of_month','day_of_year','week_of_year','hour','minute']
+                if not all(f in feature_cols for f in expected_features):
+                    logger.warning(f"加载的特征列表不完整，使用预期的特征列表: {expected_features}")
+                    feature_cols = expected_features
+                feature_classification = joblib.load(os.path.join(model_dir, 'feature_classification.pkl'))
+                knowable_future_features = feature_classification.get('knowable_future_features', expected_features)
+                unknowable_future_features = feature_classification.get('unknowable_future_features', [])
+                sc_e = joblib.load(os.path.join(model_dir, 'scaler_enc.pkl'))
+                sc_y_p = joblib.load(os.path.join(model_dir, 'scaler_y_power.pkl'))
+                sc_y_n = joblib.load(os.path.join(model_dir, 'scaler_y_not_use.pkl'))
+                model_config = joblib.load(os.path.join(model_dir, 'config.pkl'))
+
+                model = BiMambaPowerModel(
+                    c_in=len(feature_cols),
+                    seq_len=model_config['past_steps'],
+                    pred_len=model_config['future_steps'],
+                    patch_len=model_config['patch_len'],
+                    stride=model_config['stride'],
+                    d_model=model_config['d_model'],
+                    n_layers=model_config['n_layers'],
+                    d_ff=model_config['d_ff'],
+                    dropout=model_config['drop_rate'],
+                    d_state=model_config['d_state'],
+                    d_conv=model_config['d_conv'],
+                    expand=model_config['expand'],
+                    bidirectional=model_config.get('bidirectional', True)
+                )
+
+                # 加载模型权重，确保正确的设备映射
                 try:
-                    state_dict = torch.load(os.path.join(model_dir, 'bi_mamba.pth'), map_location=torch.device('cpu'))
+                    if torch.cuda.is_available() and not USE_FALLBACK_MAMBA:
+                        model.load_state_dict(torch.load(model_path))
+                        model = model.to(device)
+                        logger.info("模型已加载到CUDA设备")
+                    else:
+                        state_dict = torch.load(model_path, map_location='cpu')
+                        model.load_state_dict(state_dict, strict=False)
+                        model = model.cpu()
+                except Exception as e:
+                    logger.error(f"加载模型权重失败: {e}")
+                    state_dict = torch.load(model_path, map_location='cpu')
                     model.load_state_dict(state_dict, strict=False)
                     model = model.cpu()
-                    device = torch.device('cpu')
                     USE_FALLBACK_MAMBA = True
                     logger.info("强制在CPU上加载模型，使用Fallback实现")
-                except Exception as e2:
-                    logger.error(f"强制加载也失败: {e2}")
-                    raise e2
 
-            model.eval()
+                model.eval()
+                _MODEL_CACHE[cache_key] = {
+                    'mtime': model_mtime,
+                    'feature_cols': feature_cols,
+                    'expected_features': expected_features,
+                    'knowable_future_features': knowable_future_features,
+                    'unknowable_future_features': unknowable_future_features,
+                    'sc_e': sc_e,
+                    'sc_y_p': sc_y_p,
+                    'sc_y_n': sc_y_n,
+                    'model_config': model_config,
+                    'model': model,
+                }
 
         except Exception as e:
             logger.error(f"加载模型文件失败: {e}")
