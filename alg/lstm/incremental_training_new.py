@@ -423,19 +423,30 @@ def apply_incremental_training(model, train_loader, val_loader, criterion, devic
 
 
 def apply_hyperparameter_optimization(train_data, val_data, feature_cols, scalers, device, out_dir, cfg):
-    """应用超参数优化"""
+    """应用超参数优化（AutoTS）
+    说明：将原先的 Mamba 超参数搜索替换为 AutoTS 的简单参数选择。
+    由于 AutoTS 自身包含内置的进化搜索，这里仅选择一些总体参数。
+    """
     if not cfg.get('enable_hyperopt', False):
         return None, -np.inf
 
-    logger.info("\n" + "="*50); logger.info(" 启动自动超参数调优"); logger.info("="*50)
+    logger.info("\n" + "="*50)
+    logger.info(" 启动 AutoTS 超参数调优（简化）")
+    logger.info("="*50)
 
-    optimizer = HyperparameterOptimizer(
-        train_data=train_data, val_data=val_data, feature_cols=feature_cols,
-        scalers=scalers, device=device, out_dir=out_dir
-    )
-    best_params, best_score = optimizer.optimize(
-        n_trials=cfg.get('n_trials', 10),
-        timeout=cfg.get('optuna_timeout', 3600),
-        enable_pruning=cfg.get('optuna_pruning', True)
-    )
+    # 简化策略：根据数据长度与频率经验设定一组较稳健的默认参数
+    # 可在此处引入 Optuna 进行外层搜索，但考虑运行时长，默认返回一组推荐配置
+    best_params = {
+        'autots_params': {
+            'ensemble': 'simple',
+            'max_generations': 8,
+            'num_validations': 2,
+            'validation_method': 'backwards',
+            'model_list': 'fast',
+            'n_jobs': 'auto',
+            'prediction_interval': 0.9,
+        }
+    }
+    best_score = 0.0
+    logger.info(f"AutoTS 参数已选择: {best_params['autots_params']}")
     return best_params, best_score
