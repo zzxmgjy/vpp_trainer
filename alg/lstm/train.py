@@ -15,6 +15,10 @@ from sklearn.preprocessing import RobustScaler, LabelEncoder
 from sklearn.metrics      import mean_absolute_percentage_error, mean_squared_error
 import torch, torch.nn as nn
 import torch.nn.functional as F
+try:
+    torch.set_float32_matmul_precision('high')
+except Exception:
+    pass
 from torch.utils.data      import DataLoader, TensorDataset, WeightedRandomSampler
 from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
 from util.logger import logger
@@ -76,27 +80,22 @@ except Exception:
         def __init__(self, d_model, d_state=16, d_conv=4, expand=2, use_fast_path=True):
             super().__init__()
             self.d_model = d_model
-            self.d_state = d_state
             self.expand_dim = int(expand * d_model)
             self.in_proj = nn.Linear(d_model, self.expand_dim * 2)
-            self.conv = nn.Conv1d(self.expand_dim, self.expand_dim, d_conv, padding=d_conv-1, groups=self.expand_dim)
-            self.A = nn.Parameter(torch.randn(self.expand_dim, d_state) * 0.01)
-            self.C = nn.Parameter(torch.randn(self.expand_dim, d_state) * 0.01)
-            self.D = nn.Parameter(torch.ones(self.expand_dim) * 0.01)
+            # 深度可分离卷积（近似 Mamba 的局部混合，避免逐步循环）
+            pad = max(0, d_conv // 2)
+            self.dw_conv = nn.Conv1d(self.expand_dim, self.expand_dim, d_conv, padding=pad, groups=self.expand_dim)
+            self.pw = nn.Linear(self.expand_dim, self.expand_dim)
             self.out_proj = nn.Linear(self.expand_dim, d_model)
-        def forward(self, x):
+            self.act = nn.SiLU()
+            self.gate = nn.Sigmoid()
+        def forward(self, x):  # x: [B,L,D]
             B, L, _ = x.shape
-            x_and_z = self.in_proj(x)
-            x_proj, z = x_and_z.chunk(2, dim=-1)
-            x_conv = self.conv(x_proj.transpose(1,2))[:, :, :L].transpose(1,2)
-            x_s4 = torch.zeros_like(x_conv)
-            h = torch.zeros(B, self.A.shape[1], device=x.device)
-            for i in range(L):
-                u = torch.einsum('be,ed->bd', x_conv[:, i], self.A)
-                h = torch.tanh(u + h)
-                s4_out = torch.einsum('bd,ed->be', h, self.C) + self.D * x_conv[:, i]
-                x_s4[:, i] = s4_out
-            y = torch.sigmoid(z) * x_s4
+            x_proj, z = self.in_proj(x).chunk(2, dim=-1)
+            # 卷积期望 [B,C,L]
+            y = self.dw_conv(x_proj.transpose(1, 2))[:, :, :L].transpose(1, 2)
+            y = self.act(self.pw(y))
+            y = y * self.gate(z)
             return self.out_proj(y)
 
 # ---------- 配置 ----------

@@ -248,15 +248,23 @@ class HyperparameterOptimizer:
         X_tr, Yp_tr, Yn_tr, Mask_p_tr, Mask_n_tr = self.train_data
         X_va, Yp_va, Yn_va, Mask_p_va, Mask_n_va = self.val_data
 
+        pin_memory_flag = (self.device.type == 'cuda')
+        try:
+            cpu_cnt = os.cpu_count() or 1
+        except Exception:
+            cpu_cnt = 1
+        num_workers = max(1, min(8, cpu_cnt // 2))
         tr_loader = DataLoader(
             TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(Yp_tr), torch.from_numpy(Yn_tr),
                           torch.from_numpy(Mask_p_tr), torch.from_numpy(Mask_n_tr)),
-            batch_size=config['batch_size'], shuffle=True, pin_memory=True
+            batch_size=config['batch_size'], shuffle=True,
+            pin_memory=pin_memory_flag, num_workers=num_workers, persistent_workers=True
         )
         va_loader = DataLoader(
             TensorDataset(torch.from_numpy(X_va), torch.from_numpy(Yp_va), torch.from_numpy(Yn_va),
                           torch.from_numpy(Mask_p_va), torch.from_numpy(Mask_n_va)),
-            batch_size=config['batch_size'], pin_memory=True
+            batch_size=config['batch_size'],
+            pin_memory=pin_memory_flag, num_workers=num_workers, persistent_workers=True
         )
 
         model = BiMambaPowerModel(
